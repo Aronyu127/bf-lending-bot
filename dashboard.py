@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -12,6 +13,47 @@ from bfxapi import Client
 load_dotenv()
 
 _MS_DAY = 86400_000
+_DASH_AUTH_KEY = "_dash_auth_ok"
+
+
+def _dashboard_password() -> Optional[str]:
+    raw = os.getenv("DASHBOARD_PASSWORD")
+    if raw is None or not str(raw).strip():
+        return None
+    return str(raw)
+
+
+def _require_dashboard_auth() -> None:
+    expected = _dashboard_password()
+    if expected is None:
+        return
+    if st.session_state.get(_DASH_AUTH_KEY):
+        return
+
+    st.markdown(
+        '<p class="dashboard-title">Bitfinex 融資儀表板</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p class="dashboard-sub">請輸入密碼以繼續</p>',
+        unsafe_allow_html=True,
+    )
+    with st.form("dashboard_login_form", clear_on_submit=False):
+        entered = st.text_input("密碼", type="password", autocomplete="current-password")
+        submitted = st.form_submit_button("登入", width="stretch")
+        if submitted:
+            try:
+                ok = hmac.compare_digest(
+                    entered.encode("utf-8"),
+                    expected.encode("utf-8"),
+                )
+            except Exception:
+                ok = False
+            if ok:
+                st.session_state[_DASH_AUTH_KEY] = True
+                st.rerun()
+            st.error("密碼錯誤")
+    st.stop()
 
 
 def _daily_rate_to_apy_pct(rate: float) -> float:
@@ -500,8 +542,9 @@ def main():
         initial_sidebar_state="collapsed",
     )
     _inject_css()
+    _require_dashboard_auth()
 
-    h1, h2 = st.columns([4, 1], vertical_alignment="center")
+    h1, h2, h3 = st.columns([3, 1, 1], vertical_alignment="center")
     with h1:
         st.markdown('<p class="dashboard-title">Bitfinex 融資儀表板</p>', unsafe_allow_html=True)
         st.markdown(
@@ -513,6 +556,11 @@ def main():
         if st.button("重新整理", width="stretch"):
             _snapshot.clear()
             _public_funding_tickers.clear()
+            st.rerun()
+    with h3:
+        st.markdown("")
+        if _dashboard_password() is not None and st.button("登出", width="stretch"):
+            st.session_state.pop(_DASH_AUTH_KEY, None)
             st.rerun()
 
     try:
