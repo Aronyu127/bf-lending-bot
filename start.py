@@ -717,7 +717,7 @@ async def run_schedule_task():
 
 
 if __name__ == '__main__':
-    mode = int(sys.argv[1])
+    mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     if mode == 0:
         asyncio.run(run_schedule_task())
     else:
