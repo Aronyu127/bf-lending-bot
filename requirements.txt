@@ -20,3 +20,6 @@ typing_extensions==4.12.2
 urllib3==2.2.3
 websockets==12.0
 yarl==1.17.1
+streamlit>=1.28.0
+pandas>=2.0.0
+honcho>=1.1.0

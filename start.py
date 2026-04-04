@@ -39,7 +39,7 @@ print = lambda *args, **kwargs: logging.info(" ".join(str(a) for a in args))
 
 # API ENDPOINTS
 BITFINEX_PUBLIC_API_URL = "https://api-pub.bitfinex.com"
-_DEFAULT_MIN_FUNDS = 150.0
+_DEFAULT_MIN_FUNDS = 500.0
 _MF_RAW = os.getenv("MINIMUM_FUNDS")
 MINIMUM_FUNDS = (
     float(str(_MF_RAW).strip())
@@ -52,17 +52,18 @@ BITFINEX_MIN_FUNDING_ORDER_USD = (
     if _EX_MIN_RAW is not None and str(_EX_MIN_RAW).strip()
     else 150.0
 )
-DEFAULT_FUND_CURRENCY = "fUST"
+DEFAULT_FUND_CURRENCY = "fUSD"
+
+
+_BITFINEX_FEE_RATE = 0.85  # Bitfinex charges 15% on funding earnings
 
 
 def _explicit_high_rate_apy_min() -> float | None:
     raw = os.getenv("HIGH_RATE_APY_MIN")
     if raw is None or not str(raw).strip():
         return None
-    return float(str(raw).strip())
-
-
-_BITFINEX_FEE_RATE = 0.85  # Bitfinex charges 15% on funding earnings
+    # env var is gross APY %; convert to net APY for internal comparison
+    return float(str(raw).strip()) * _BITFINEX_FEE_RATE
 
 
 def _default_high_rate_apy_min_for_currency(currency: str) -> float:

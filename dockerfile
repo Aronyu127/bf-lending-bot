@@ -1,13 +1,15 @@
-FROM timwarr/python3.11-talib 
+FROM timwarr/python3.11-talib
 
-# Set the working directory to /app
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . /app
 
-# Install dependencies from requirements.txt
-RUN pip install -r requirements.txt
+ENV PORT=8501
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8501
 
-# Run python when the container launches
-CMD ["python", "./start.py"]
+# Runs lending bot (start.py 1 = every minute) + Streamlit dashboard on PORT
+CMD ["honcho", "start"]
