@@ -699,10 +699,6 @@ async def lending_bot_strategy():
         )
         margin_split_ratio_dict = {2: 1.0, 30: 0.0, 60: 0.0, 120: 0.0}
 
-    if my_offers and _offers_within_ladder(my_offers, currency, rate_avg_dict, offer_rate_guess_upper):
-        print("All existing offers within ladder range — skip cancel/replace")
-        return
-
     time.sleep(0.5)
     cancel_res = await remove_all_lending_offer(currency[1:])
     print(f"cancel_res: {cancel_res}")
