@@ -717,7 +717,7 @@ if __name__ == '__main__':
     if mode == 0:
         asyncio.run(run_schedule_task())
     else:
-        schedule.every(5).minutes.do(lambda: asyncio.run(run_schedule_task()))
+        schedule.every(2).minutes.do(lambda: asyncio.run(run_schedule_task()))
         asyncio.run(run_schedule_task())
         while True:
             schedule.run_pending()
