@@ -1,21 +1,20 @@
-import os,sys,time,platform,math
+import os, sys, time, math
 import logging
 import logging.handlers
 from dotenv import load_dotenv
 load_dotenv()
 import schedule
 import asyncio
-from typing import List
+from typing import List, Dict, Tuple, Optional
 from bfxapi import Client
-from bfxapi.types import Wallet
-import platform
+from bfxapi.types import Wallet, FundingCredit, FundingOffer
 import ssl
 import certifi
 import aiohttp
 
 _AIOHTTP_SSL = ssl.create_default_context(cafile=certifi.where())
 
-# Log rotation: compressed, keep 30 days (5-min interval ~26 MB raw, ~5 MB compressed)
+# Log rotation: compressed, keep 30 days
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _log_handler = logging.handlers.TimedRotatingFileHandler(
@@ -35,10 +34,15 @@ logging.basicConfig(
     format="%(asctime)s %(message)s",
     handlers=[_log_handler, logging.StreamHandler()],
 )
-print = lambda *args, **kwargs: logging.info(" ".join(str(a) for a in args))
+log = logging.info
 
-# API ENDPOINTS
+# =============================================================================
+# Constants
+# =============================================================================
+
 BITFINEX_PUBLIC_API_URL = "https://api-pub.bitfinex.com"
+DEFAULT_FUND_CURRENCY = "fUSD"
+
 _DEFAULT_MIN_FUNDS = 500.0
 _MF_RAW = os.getenv("MINIMUM_FUNDS")
 MINIMUM_FUNDS = (
@@ -52,66 +56,171 @@ BITFINEX_MIN_FUNDING_ORDER_USD = (
     if _EX_MIN_RAW is not None and str(_EX_MIN_RAW).strip()
     else 150.0
 )
-DEFAULT_FUND_CURRENCY = "fUSD"
 
+# =============================================================================
+# Strategy config (centralized, env-overridable)
+# =============================================================================
 
-_BITFINEX_FEE_RATE = 0.85  # Bitfinex charges 15% on funding earnings
-
-
-def _explicit_high_rate_apy_min() -> float | None:
-    raw = os.getenv("HIGH_RATE_APY_MIN")
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
     if raw is None or not str(raw).strip():
-        return None
-    # env var is gross APY %; convert to net APY for internal comparison
-    return float(str(raw).strip()) * _BITFINEX_FEE_RATE
-
-
-def _default_high_rate_apy_min_for_currency(currency: str) -> float:
-    # Thresholds are net APY (after 15% fee): fUSD=17%, fUST~14.875%
-    c = (currency or "").strip().lower()
-    if c == "fust":
-        return 14.875
-    return 17.0
-
-
-def effective_high_rate_apy_min(currency: str) -> float:
-    v = _explicit_high_rate_apy_min()
-    if v is not None:
-        return v
-    return _default_high_rate_apy_min_for_currency((currency or "").strip().lower())
-
-
-def _split_buckets_all_meet_min(funds: float, split: dict, min_o: float) -> bool:
-    for r in split.values():
-        if r < 0.01:
-            continue
-        if funds * r + 1e-9 < min_o:
-            return False
-    return True
-
-
-def _load_high_rate_margin_split():
-    raw = os.getenv("HIGH_RATE_MARGIN_SPLIT")
-    default = (0.30, 0.15, 0.0, 0.55)
-    keys = (2, 30, 60, 120)
-    if raw is None or not str(raw).strip():
-        return dict(zip(keys, default))
+        return default
     try:
-        parts = [float(x.strip()) for x in str(raw).split(",")]
-        if len(parts) != 4:
-            return dict(zip(keys, default))
-        s = sum(parts)
-        if s <= 0:
-            return dict(zip(keys, default))
-        return {k: v / s for k, v in zip(keys, parts)}
+        return float(str(raw).strip())
     except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(float(str(raw).strip()))
+    except ValueError:
+        return default
+
+
+def _env_split(name: str, default: Tuple[float, ...], keys: Tuple[int, ...]) -> Dict[int, float]:
+    """Parse a comma-separated split and hard-validate sum≈1 (±0.01).
+    Silent normalization would let `0.5,0.5,0.5` become `1/3,1/3,1/3` with no
+    warning, making the actual allocation disagree with what's written in .env —
+    so we raise instead, matching the BASE_SPLIT_* validation philosophy."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
         return dict(zip(keys, default))
+    parts = [float(x.strip()) for x in str(raw).split(",")]
+    if len(parts) != len(keys):
+        raise ValueError(f"{name} expects {len(keys)} comma-separated values, got {len(parts)}")
+    for p in parts:
+        if p < 0 or p > 1:
+            raise ValueError(f"{name} value {p} must be in [0, 1]")
+    s = sum(parts)
+    if abs(s - 1.0) > 0.01:
+        raise ValueError(f"{name} sum={s:.4f}, expected 1.0 (±0.01)")
+    return dict(zip(keys, parts))
 
 
-HIGH_RATE_MARGIN_SPLIT = _load_high_rate_margin_split()
+# Locked high-rate loan definition
+LOCKED_MIN_PERIOD_DAYS = _env_int("LOCKED_MIN_PERIOD_DAYS", 60)
+LOCKED_MIN_RATE = _env_float("LOCKED_MIN_RATE", 0.00040)
+
+# Base mode split (applied to available_capital when no spike)
+#   2d / 120d-preposition / reserve
+BASE_SPLIT_2D = _env_float("BASE_SPLIT_2D", 0.70)
+BASE_SPLIT_120D_PREPOSITION = _env_float("BASE_SPLIT_120D_PREPOSITION", 0.25)
+BASE_SPLIT_RESERVE = _env_float("BASE_SPLIT_RESERVE", 0.05)
+
+# Pre-positioning
+#   target_rate = clamp(p99_rate * 0.98, [floor, ceil])
+PREPOSITION_PERIOD = _env_int("PREPOSITION_PERIOD", 120)
+PREPOSITION_RATE_FLOOR = _env_float("PREPOSITION_RATE_FLOOR", 0.00040)
+PREPOSITION_RATE_CEIL = _env_float("PREPOSITION_RATE_CEIL", 0.00048)
+PREPOSITION_P99_MULT = _env_float("PREPOSITION_P99_MULT", 0.98)
+PREPOSITION_LOOKBACK_DAYS = _env_int("PREPOSITION_LOOKBACK_DAYS", 3)
+# Tolerance band around target_rate for keeping existing preposition offers in place.
+PREPOSITION_TOLERANCE = _env_float("PREPOSITION_TOLERANCE", 0.00002)
+
+# Spike detection
+SPIKE_L1_MULTIPLIER = _env_float("SPIKE_L1_MULTIPLIER", 1.8)  # last-1m avg / 24h avg
+SPIKE_L2_MIN_RATE = _env_float("SPIKE_L2_MIN_RATE", 0.00035)  # max rate in last 1m
+SPIKE_L1_MIN_LONG_PERIOD = _env_int("SPIKE_L1_MIN_LONG_PERIOD", 30)
+SPIKE_L2_MIN_LONG_PERIOD = _env_int("SPIKE_L2_MIN_LONG_PERIOD", 120)
+SPIKE_L2_MIN_LONG_TRADES = _env_int("SPIKE_L2_MIN_LONG_TRADES", 2)
+SPIKE_RECENT_WINDOW_SEC = _env_int("SPIKE_RECENT_WINDOW_SEC", 60)
+SPIKE_BASELINE_WINDOW_SEC = _env_int("SPIKE_BASELINE_WINDOW_SEC", 86400)
+
+# Spike splits (applied to available_capital when a spike is active)
+#   keys: 2d / 30d / 120d
+SPIKE_SPLIT_L1 = _env_split("SPIKE_SPLIT_L1", (0.40, 0.20, 0.40), (2, 30, 120))
+SPIKE_SPLIT_L2 = _env_split("SPIKE_SPLIT_L2", (0.10, 0.20, 0.70), (2, 30, 120))
+
+# Rate ladder shape (used for 2d/30d buckets that need multi-step laddering)
+#   rate_low  = max(market_floor, p{LADDER_LOW_PCT} of last-24h trades for that tenor)
+#   rate_high = p{LADDER_HIGH_PCT} of last-24h trades for that tenor
+LADDER_LOW_PCT = _env_float("LADDER_LOW_PCT", 30.0)
+LADDER_HIGH_PCT = _env_float("LADDER_HIGH_PCT", 95.0)
+LADDER_MIN_SAMPLES = _env_int("LADDER_MIN_SAMPLES", 20)
+_STEPS_MAX_BUCKET_SIZE = 1000.0
+
+# Preposition target rate minimum sample threshold (for p99 calc)
+PREPOSITION_MIN_SAMPLES = _env_int("PREPOSITION_MIN_SAMPLES", 50)
+
+# Dry-run: log orders without hitting the exchange
+DRY_RUN = str(os.getenv("DRY_RUN", "")).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _resolve_fund_currency():
+def _validate_config() -> None:
+    """Hard-validate config at startup. Raise ValueError on any misconfiguration
+    that could cause the bot to silently misallocate funds."""
+    errors: List[str] = []
+
+    base_sum = BASE_SPLIT_2D + BASE_SPLIT_120D_PREPOSITION + BASE_SPLIT_RESERVE
+    if abs(base_sum - 1.0) > 0.01:
+        errors.append(
+            f"BASE_SPLIT_2D ({BASE_SPLIT_2D}) + BASE_SPLIT_120D_PREPOSITION "
+            f"({BASE_SPLIT_120D_PREPOSITION}) + BASE_SPLIT_RESERVE "
+            f"({BASE_SPLIT_RESERVE}) = {base_sum:.4f}, expected 1.0 (±0.01)"
+        )
+    for v, name in (
+        (BASE_SPLIT_2D, "BASE_SPLIT_2D"),
+        (BASE_SPLIT_120D_PREPOSITION, "BASE_SPLIT_120D_PREPOSITION"),
+        (BASE_SPLIT_RESERVE, "BASE_SPLIT_RESERVE"),
+    ):
+        if v < 0 or v > 1:
+            errors.append(f"{name}={v} must be in [0, 1]")
+
+    # Spike splits are hard-validated inside _env_split at import time (sum≈1,
+    # each value in [0,1]), so no extra check here.
+
+    if PREPOSITION_RATE_FLOOR >= PREPOSITION_RATE_CEIL:
+        errors.append(
+            f"PREPOSITION_RATE_FLOOR ({PREPOSITION_RATE_FLOOR}) must be < "
+            f"PREPOSITION_RATE_CEIL ({PREPOSITION_RATE_CEIL})"
+        )
+    if not (0 < PREPOSITION_P99_MULT <= 1.5):
+        errors.append(f"PREPOSITION_P99_MULT ({PREPOSITION_P99_MULT}) must be in (0, 1.5]")
+    if LOCKED_MIN_PERIOD_DAYS < 1 or LOCKED_MIN_PERIOD_DAYS > 120:
+        errors.append(f"LOCKED_MIN_PERIOD_DAYS ({LOCKED_MIN_PERIOD_DAYS}) must be in [1, 120]")
+    if LOCKED_MIN_RATE <= 0:
+        errors.append(f"LOCKED_MIN_RATE ({LOCKED_MIN_RATE}) must be > 0")
+    if not (0 < LADDER_LOW_PCT < LADDER_HIGH_PCT <= 100):
+        errors.append(
+            f"LADDER_LOW_PCT ({LADDER_LOW_PCT}) must be < LADDER_HIGH_PCT "
+            f"({LADDER_HIGH_PCT}), both in (0, 100]"
+        )
+    if SPIKE_RECENT_WINDOW_SEC >= SPIKE_BASELINE_WINDOW_SEC:
+        errors.append(
+            f"SPIKE_RECENT_WINDOW_SEC ({SPIKE_RECENT_WINDOW_SEC}) must be < "
+            f"SPIKE_BASELINE_WINDOW_SEC ({SPIKE_BASELINE_WINDOW_SEC})"
+        )
+    if SPIKE_L1_MULTIPLIER <= 1.0:
+        errors.append(f"SPIKE_L1_MULTIPLIER ({SPIKE_L1_MULTIPLIER}) must be > 1.0")
+
+    if errors:
+        raise ValueError("Invalid strategy configuration:\n  - " + "\n  - ".join(errors))
+
+
+# =============================================================================
+# Client (lazy — initialised by setup() so `import start` stays side-effect-free)
+# =============================================================================
+
+bfx: Optional[Client] = None
+
+
+def setup() -> None:
+    """Validate config and build the Bitfinex client. Call from main guard."""
+    global bfx
+    _validate_config()
+    log(
+        f"Config OK: base_split=({BASE_SPLIT_2D},{BASE_SPLIT_120D_PREPOSITION},"
+        f"{BASE_SPLIT_RESERVE}) spike_l1={SPIKE_SPLIT_L1} spike_l2={SPIKE_SPLIT_L2} "
+        f"preposition=[{PREPOSITION_RATE_FLOOR},{PREPOSITION_RATE_CEIL}] DRY_RUN={DRY_RUN}"
+    )
+    bfx = Client(api_key=os.getenv("BF_API_KEY"), api_secret=os.getenv("BF_API_SECRET"))
+
+
+def _resolve_fund_currency() -> str:
     raw = os.getenv("FUND_CURRENCY")
     if raw is None or not str(raw).strip():
         return DEFAULT_FUND_CURRENCY
@@ -120,31 +229,29 @@ def _resolve_fund_currency():
         return "f" + s[1:]
     return "f" + s
 
-""" Strategy Parameters, Modify here"""
-_STEPS_MAX_BUCKET_SIZE = 1000.0  # max USD per step; steps = ceil(budget / this), min 10
-highest_sentiment = 5 # highest sentiment to adjust from fair rate to market highest rate
-_RA_RAW = os.getenv("RATE_ADJUSTMENT_RATIO")
-rate_adjustment_ratio = (
-    float(str(_RA_RAW).strip())
-    if _RA_RAW is not None and str(_RA_RAW).strip()
-    else 1.11
-)
-# interval = 1 # interval one hour
+
+# =============================================================================
+# Public market data
+# =============================================================================
+
+# Below this USD volume a tenor bucket is treated as "too thin" — we propagate
+# the shorter-tenor ravg forward instead of trusting the tiny sample's own avg.
+_BOOK_MIN_VOLUME_USD = 1000.0
 
 
-bfx = Client(api_key=os.getenv("BF_API_KEY"), api_secret=os.getenv("BF_API_SECRET"))
+async def get_market_funding_book(currency: str):
+    """Aggregate order book per tenor bucket (2/30/60/120 days).
 
-
-"""Get funding book data from Bitfinex"""
-async def get_market_funding_book(currency=None):
-    if currency is None:
-        currency = _resolve_fund_currency()
-    #total volume in whole market
-    market_fday_volume_dict = {2: 1, 30: 1, 60: 1, 120: 1} # can't be 0
-    #highest rate in each day set whole market
-    market_frate_upper_dict = {2: -999, 30: -999, 60: -999, 120: -999}
-    # weighted average rate in each day set whole market
-    market_frate_ravg_dict = {2: 0, 30: 0, 60: 0, 120: 0}
+    Returns (volume_dict, rate_upper_dict, rate_ravg_dict).
+    rate_ravg is the volume-weighted mean rate. If a tenor bucket's volume is
+    below _BOOK_MIN_VOLUME_USD, its ravg is unreliable and we propagate the
+    previous tenor's ravg forward. upper defaults to the previous tenor's upper
+    in the same situation.
+    """
+    market_fday_volume_dict = {2: 0.0, 30: 0.0, 60: 0.0, 120: 0.0}
+    market_frate_upper_dict: Dict[int, float] = {2: 0.0, 30: 0.0, 60: 0.0, 120: 0.0}
+    market_frate_ravg_dict: Dict[int, float] = {2: 0.0, 30: 0.0, 60: 0.0, 120: 0.0}
+    weighted_sum: Dict[int, float] = {2: 0.0, 30: 0.0, 60: 0.0, 120: 0.0}
 
     connector = aiohttp.TCPConnector(ssl=_AIOHTTP_SSL)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -156,96 +263,130 @@ async def get_market_funding_book(currency=None):
                 for offer in book_data:
                     numdays = offer[2]
                     if numdays == 2:
-                        market_fday_volume_dict[2] += abs(offer[3])
-                        market_frate_upper_dict[2] = max(market_frate_upper_dict[2], offer[0])
-                        market_frate_ravg_dict[2] += offer[0] * abs(offer[3])
+                        bucket = 2
                     elif 3 <= numdays <= 30:
-                        market_fday_volume_dict[30] += abs(offer[3])
-                        market_frate_upper_dict[30] = max(market_frate_upper_dict[30], offer[0])
-                        market_frate_ravg_dict[30] += offer[0] * abs(offer[3])
+                        bucket = 30
                     elif 31 <= numdays <= 60:
-                        market_fday_volume_dict[60] += abs(offer[3])
-                        market_frate_upper_dict[60] = max(market_frate_upper_dict[60], offer[0])
-                        market_frate_ravg_dict[60] += offer[0] * abs(offer[3])
+                        bucket = 60
                     elif 61 <= numdays <= 120:
-                        market_fday_volume_dict[120] += abs(offer[3])
-                        market_frate_upper_dict[120] = max(market_frate_upper_dict[120], offer[0])
-                        market_frate_ravg_dict[120] += offer[0] * abs(offer[3])
+                        bucket = 120
+                    else:
+                        continue
+                    vol = abs(offer[3])
+                    market_fday_volume_dict[bucket] += vol
+                    market_frate_upper_dict[bucket] = max(
+                        market_frate_upper_dict[bucket], offer[0]
+                    )
+                    weighted_sum[bucket] += offer[0] * vol
 
-    market_frate_ravg_dict[2] /= market_fday_volume_dict[2]
-    market_frate_ravg_dict[30] /= market_fday_volume_dict[30]
-    if market_fday_volume_dict[30] < market_frate_ravg_dict[2]*1.5:
-        market_frate_ravg_dict[30] = market_frate_ravg_dict[2]
-    market_frate_ravg_dict[60] /= market_fday_volume_dict[60]
-    if market_fday_volume_dict[60] < market_frate_ravg_dict[30]:
-        market_frate_ravg_dict[60] = market_frate_ravg_dict[30]
-    market_frate_ravg_dict[120] /= market_fday_volume_dict[120]
-    if market_fday_volume_dict[120] < market_frate_ravg_dict[60]:
-        market_frate_ravg_dict[120] = market_frate_ravg_dict[60]
+    for p in (2, 30, 60, 120):
+        v = market_fday_volume_dict[p]
+        market_frate_ravg_dict[p] = (weighted_sum[p] / v) if v > 0 else 0.0
 
-    print("market_fday_volume_dict:")
-    print(market_fday_volume_dict)
-    print("market_frate_upper_dict:")
-    print(market_frate_upper_dict)
-    print("market_frate_ravg_dict:")
-    print(market_frate_ravg_dict)
-    # return total volume, highest rate, lowest rate
-    return market_fday_volume_dict,market_frate_upper_dict,market_frate_ravg_dict
+    # Propagate shorter-tenor values forward for thin buckets (volume < threshold).
+    # This keeps ladder fallbacks sane when the longer-tenor book is sparse.
+    tenors = (2, 30, 60, 120)
+    for i in range(1, len(tenors)):
+        cur, prev = tenors[i], tenors[i - 1]
+        if market_fday_volume_dict[cur] < _BOOK_MIN_VOLUME_USD:
+            market_frate_ravg_dict[cur] = market_frate_ravg_dict[prev]
+            if market_frate_upper_dict[cur] <= 0:
+                market_frate_upper_dict[cur] = market_frate_upper_dict[prev]
 
-"""Calculate how FOMO the market is"""
-async def get_market_borrow_sentiment(currency=None):
-    if currency is None:
-        currency = _resolve_fund_currency()
-    #TODO: fetch matching book from https://report.bitfinex.com/api/json-rpc
-    url = f"{BITFINEX_PUBLIC_API_URL}/v2/funding/stats/{currency}/hist"
+    log(f"market_fday_volume_dict: {market_fday_volume_dict}")
+    log(f"market_frate_upper_dict: {market_frate_upper_dict}")
+    log(f"market_frate_ravg_dict: {market_frate_ravg_dict}")
+    return market_fday_volume_dict, market_frate_upper_dict, market_frate_ravg_dict
+
+
+_PUBLIC_TRADES_LIMIT = 10000
+
+
+async def _fetch_public_trades(currency: str, since_ms: int) -> list:
+    """Public funding trades from `since_ms` until now. Returns list of [id, mts, amount, rate, period]."""
+    url = (
+        f"{BITFINEX_PUBLIC_API_URL}/v2/trades/{currency}/hist"
+        f"?start={since_ms}&limit={_PUBLIC_TRADES_LIMIT}&sort=1"
+    )
     connector = aiohttp.TCPConnector(ssl=_AIOHTTP_SSL)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            fdata = await response.json()
-            need_rows = 13
-            if (
-                not isinstance(fdata, list)
-                or len(fdata) < need_rows
-                or not isinstance(fdata[0], list)
-                or len(fdata[0]) <= 8
-            ):
-                print(
-                    f"Warning: funding stats missing or short for {currency!r} (got {len(fdata) if isinstance(fdata, list) else type(fdata)} rows), sentiment=1.0"
-                )
-                return 1.0
-            funding_amount_used_today = fdata[0][8]
-            funding_amount_used_avg = 0
-            for n in range(1, need_rows):
-                row = fdata[n]
-                if not isinstance(row, list) or len(row) <= 8:
-                    print(f"Warning: funding stats row {n} invalid for {currency!r}, sentiment=1.0")
-                    return 1.0
-                funding_amount_used_avg += row[8]
-
-            funding_amount_used_avg /= 12
-            if not funding_amount_used_avg:
-                print(f"Warning: zero avg funding used for {currency!r}, sentiment=1.0")
-                return 1.0
-            sentiment = funding_amount_used_today / funding_amount_used_avg
-            print(f"funding_amount_used_today: {funding_amount_used_today}, funding_amount_used_avg: {funding_amount_used_avg}, sentiment: {sentiment}")
-            return sentiment
-        
-
-def _valid_book_upper(u: float) -> bool:
     try:
-        return u is not None and float(u) > 0.0
-    except (TypeError, ValueError):
-        return False
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                if isinstance(data, list):
+                    if len(data) >= _PUBLIC_TRADES_LIMIT:
+                        log(
+                            f"Warning: public trades fetch hit limit {_PUBLIC_TRADES_LIMIT}; "
+                            f"older samples truncated."
+                        )
+                    return data
+                return []
+    except Exception as e:
+        log(f"Warning: public trades fetch failed: {e}")
+        return []
 
 
-def _cap_with_book(model_upper: float, book_upper: float) -> float:
-    if _valid_book_upper(book_upper):
-        return max(model_upper, float(book_upper))
-    return model_upper
+def _filter_trades_by_period(trades: list, period_min: int, period_max: int) -> List[float]:
+    """Return the list of rates for trades whose period is in [period_min, period_max]."""
+    out: List[float] = []
+    for t in trades or []:
+        try:
+            rate = float(t[3])
+            period = int(t[4])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if rate <= 0:
+            continue
+        if period_min <= period <= period_max:
+            out.append(rate)
+    return out
 
 
-def _percentile_sorted(values: list[float], pct: float) -> float:
+def compute_ladder_range(
+    trades_24h: list,
+    period_min: int,
+    period_max: int,
+    book_fallback_low: float,
+    book_fallback_high: float,
+) -> Tuple[float, float]:
+    """
+    Build a (rate_low, rate_high) ladder range from the last 24h public trades
+    whose period falls in [period_min, period_max].
+
+    - rate_low  = p{LADDER_LOW_PCT}  of the selected trades
+    - rate_high = p{LADDER_HIGH_PCT} of the selected trades
+
+    If samples are insufficient, fall back to the book-derived values.
+    If rate_high <= rate_low for any reason, expand by 10% so the ladder
+    actually spans a range.
+    """
+    rates = _filter_trades_by_period(trades_24h, period_min, period_max)
+    if len(rates) < LADDER_MIN_SAMPLES:
+        log(
+            f"Ladder {period_min}-{period_max}d: only {len(rates)} trade samples "
+            f"(< {LADDER_MIN_SAMPLES}); falling back to book "
+            f"[{book_fallback_low}, {book_fallback_high}]"
+        )
+        low, high = book_fallback_low, book_fallback_high
+    else:
+        low = _percentile_sorted(rates, LADDER_LOW_PCT)
+        high = _percentile_sorted(rates, LADDER_HIGH_PCT)
+        log(
+            f"Ladder {period_min}-{period_max}d: p{LADDER_LOW_PCT}={low:.8f} "
+            f"p{LADDER_HIGH_PCT}={high:.8f} (samples={len(rates)})"
+        )
+
+    if high <= low:
+        high = low * 1.10 if low > 0 else max(high, 0.00001)
+        log(
+            f"Ladder {period_min}-{period_max}d: high<=low after percentile, "
+            f"expanded to [{low:.8f}, {high:.8f}]"
+        )
+    return low, high
+
+
+def _percentile_sorted(values: List[float], pct: float) -> float:
     if not values:
         return float("nan")
     xs = sorted(values)
@@ -259,273 +400,280 @@ def _percentile_sorted(values: list[float], pct: float) -> float:
     return xs[f] + (k - f) * (xs[c] - xs[f])
 
 
-def _apply_hist_cap_to_ladder_tops(
-    upper: dict,
-    avg: dict,
-    hist_ref_daily: float,
-    slack_mult: float,
-) -> dict:
-    lim = max(0.0, float(hist_ref_daily)) * max(1.0, float(slack_mult))
-    out = {}
-    for p in (2, 30, 60, 120):
-        u = float(upper[p])
-        av = float(avg[p])
-        capped = min(u, lim)
-        if capped + 1e-12 < av:
-            capped = av
-        out[p] = capped
-    return out
+# =============================================================================
+# Pre-positioning target rate (p99 of hourly funding candle HIGHs)
+# =============================================================================
+
+_PREPOSITION_CANDLE_KEY = "trade:1h:{currency}:a30:p2:p30"
 
 
-def _margin_split_from_2d_top(currency: str, top_daily: float) -> dict:
-    hr_min = effective_high_rate_apy_min(currency)
-    top_net_apy_pct = float(top_daily) * 100.0 * 365.0 * _BITFINEX_FEE_RATE
-    if top_net_apy_pct + 1e-9 >= hr_min:
-        return dict(HIGH_RATE_MARGIN_SPLIT)
-    return {2: 1.0, 30: 0.0, 60: 0.0, 120: 0.0}
+async def _fetch_funding_candles_high(currency: str, since_ms: int) -> List[float]:
+    """
+    Fetch hourly HIGH funding rates from the aggregated candle endpoint.
 
+    Uses `trade:1h:{currency}:a30:p2:p30` which aggregates trades with
+    amount>=30 and period in [2, 30]. For a multi-day window this is a small
+    number of candles (e.g. ~72 for 3d, ~168 for 7d), far under any API page
+    limit, so no truncation.
 
-def _parse_funding_candle_highs(data: list) -> dict[int, float]:
-    by_mts: dict[int, float] = {}
-    for row in data:
-        if not isinstance(row, list) or len(row) <= 3:
-            continue
-        try:
-            mts = int(row[0])
-            h = float(row[3])
-        except (TypeError, ValueError):
-            continue
-        if 0 < h < 0.5:
-            by_mts[mts] = h
-    return by_mts
-
-
-async def fetch_funding_hist_high_percentile(currency: str) -> float | None:
-    if os.getenv("FUNDING_HIST_DISABLE", "").strip().lower() in ("1", "true", "yes", "on"):
-        return None
-
+    Returns a list of HIGH rates (one per candle). Empty list on failure.
+    """
+    key = _PREPOSITION_CANDLE_KEY.format(currency=currency)
+    url = (
+        f"{BITFINEX_PUBLIC_API_URL}/v2/candles/{key}/hist"
+        f"?start={since_ms}&limit=10000&sort=1"
+    )
+    connector = aiohttp.TCPConnector(ssl=_AIOHTTP_SSL)
     try:
-        pct = float(os.getenv("FUNDING_HIST_PERCENTILE", "92"))
-    except ValueError:
-        pct = 92.0
-    pct = max(50.0, min(pct, 99.9))
-
-    raw_iv = os.getenv("FUNDING_HIST_INTERVAL", "12h").strip().lower()
-    interval = "1h" if raw_iv in ("1h", "60m") else "12h"
-
-    sym = f"{currency}:a30:p2:p30"
-    end_ms = int(time.time() * 1000)
-
-    if interval == "1h":
-        try:
-            days = int(float(os.getenv("FUNDING_HIST_LOOKBACK_DAYS", "45")))
-        except ValueError:
-            days = 45
-        days = max(7, min(days, 120))
-        start_ms = end_ms - int(days * 86400 * 1000)
-        url = (
-            f"{BITFINEX_PUBLIC_API_URL}/v2/candles/trade:1h:{sym}/hist"
-            f"?start={start_ms}&end={end_ms}&limit=10000&sort=1"
-        )
-    else:
-        try:
-            bar_count = int(float(os.getenv("FUNDING_HIST_BAR_COUNT", "8")))
-        except ValueError:
-            bar_count = 8
-        bar_count = max(3, min(bar_count, 500))
-        hours_per = 12
-        extra = int(bar_count) + 4
-        start_ms = end_ms - int(extra * hours_per * 3600 * 1000)
-        url = (
-            f"{BITFINEX_PUBLIC_API_URL}/v2/candles/trade:12h:{sym}/hist"
-            f"?start={start_ms}&end={end_ms}&limit={extra}&sort=1"
-        )
-
-    try:
-        connector = aiohttp.TCPConnector(ssl=_AIOHTTP_SSL)
-        async with aiohttp.ClientSession(
-            connector=connector,
-            headers={"User-Agent": "bf-lending-bot/1.0"},
-        ) as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
     except Exception as e:
-        print(f"Warning: funding history candles failed: {e}")
-        return None
-    if not isinstance(data, list):
-        return None
-
-    by_mts = _parse_funding_candle_highs(data)
-    if not by_mts:
-        print("Warning: funding history candle parse empty, skip hist cap")
-        return None
-
-    if interval == "1h":
-        highs = list(by_mts.values())
-        if len(highs) < 48:
-            print(f"Warning: funding history too few samples ({len(highs)}), skip hist cap")
-            return None
-        return _percentile_sorted(highs, pct)
-
-    try:
-        bar_count = int(float(os.getenv("FUNDING_HIST_BAR_COUNT", "8")))
-    except ValueError:
-        bar_count = 8
-    bar_count = max(3, min(bar_count, 500))
-
-    chron = sorted(by_mts.items(), key=lambda x: x[0])
-    drop_forming = os.getenv("FUNDING_HIST_INCLUDE_FORMING", "").strip().lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    if drop_forming and len(chron) > 1:
-        chron = chron[:-1]
-    highs_tail = [h for _, h in chron[-bar_count:]]
-    if len(highs_tail) < bar_count:
-        print(
-            f"Warning: funding 12h history need {bar_count} bars, got {len(highs_tail)} after trim, skip hist cap"
-        )
-        return None
-
-    ref = _percentile_sorted(highs_tail, pct)
-    print(
-        f"Hist load: 12h x{bar_count} closed bars (drop_forming={drop_forming}), "
-        f"p{pct} ref_daily={ref:.8f}"
-    )
-    return ref
-
-
-"""Guess offer rate from funding book data"""
-def guess_funding_book(
-    currency,
-    volume_dict,
-    rate_upper_dict,
-    rate_avg_dict,
-    sentiment,
-    hist_cap_daily: float | None = None,
-    hist_slack: float = 1.03,
-):
-    last_step_percentage = 1 + (rate_adjustment_ratio - 1.0) * 10  # use fixed 10 steps for rate estimation
-    sentiment_ratio = max(1.0, sentiment / highest_sentiment)
-    rate_guess_2 = rate_avg_dict[2] * last_step_percentage * sentiment_ratio
-    rate_guess_30 = rate_avg_dict[30] * last_step_percentage * sentiment_ratio
-    rate_guess_60 = rate_avg_dict[60] * last_step_percentage * sentiment_ratio
-    rate_guess_120 = rate_avg_dict[120] * last_step_percentage * sentiment_ratio
-    rate_guess_upper = {
-        2: _cap_with_book(rate_guess_2, rate_upper_dict[2]),
-        30: _cap_with_book(rate_guess_30, rate_upper_dict[30]),
-        60: _cap_with_book(rate_guess_60, rate_upper_dict[60]),
-        120: _cap_with_book(rate_guess_120, rate_upper_dict[120]),
-    }
-    if hist_cap_daily is not None and hist_cap_daily > 0:
-        before2 = rate_guess_upper[2]
-        rate_guess_upper = _apply_hist_cap_to_ladder_tops(
-            rate_guess_upper, rate_avg_dict, hist_cap_daily, hist_slack
-        )
-        print(
-            f"Hist cap: ref_daily={hist_cap_daily:.8f} slack={hist_slack} "
-            f"2d_top {before2:.8f} -> {rate_guess_upper[2]:.8f} "
-            f"(APY {rate_guess_upper[2] * 365 * 100:.2f}%)"
-        )
-    margin_split_ratio_dict = _margin_split_from_2d_top(currency, rate_guess_upper[2])
-    hr_min = effective_high_rate_apy_min(currency)
-    top_net_apy_pct = rate_guess_upper[2] * 100.0 * 365.0 * _BITFINEX_FEE_RATE
-    if margin_split_ratio_dict.get(2, 0) >= 0.99:
-        print(f"Normal mode: 2d ladder top net APY {top_net_apy_pct:.2f}% < {hr_min}%")
-    else:
-        print(
-            f"High-rate mode: 2d ladder top net APY {top_net_apy_pct:.2f}% >= {hr_min}% "
-            f"=> margin_split_ratio_dict={margin_split_ratio_dict}"
-        )
-    print(f"margin_split_ratio_dict: {margin_split_ratio_dict}, rate_guess_upper: {rate_guess_upper}")
-    return margin_split_ratio_dict, rate_guess_upper
-
-
-""" get all offers in my book """
-async def list_lending_offers(currency):
-    try:
-        return bfx.rest.auth.get_funding_offers(symbol=currency)
-    except Exception as e:
-        print(f"Error getting lending offers: {e}")
+        log(f"Warning: funding candles fetch failed: {e}")
         return []
 
-""" remove current offer in my book """
-async def remove_all_lending_offer(currency):
+    if not isinstance(data, list):
+        return []
+
+    highs: List[float] = []
+    for row in data:
+        try:
+            high = float(row[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if high > 0:
+            highs.append(high)
+    return highs
+
+
+async def compute_preposition_target_rate(currency: str) -> Tuple[float, str]:
+    """
+    target_rate = clamp(p99_of_hourly_highs * PREPOSITION_P99_MULT, [floor, ceil])
+
+    Uses last PREPOSITION_LOOKBACK_DAYS of hourly funding candle HIGHs.
+    HIGH is the per-hour peak, which is exactly what we want to track for
+    the "preposition at high-rate zone" strategy, and the candle endpoint
+    never truncates for our window size.
+
+    Falls back to the floor when samples are insufficient or the API fails.
+    Returns (rate, source_label) for logging.
+    """
+    now_s = time.time()
+    since_s = now_s - PREPOSITION_LOOKBACK_DAYS * 86400
+    since_ms = int(since_s * 1000)
+
+    def _fmt(ts: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+    window_label = (
+        f"{_fmt(since_s)} ~ {_fmt(now_s)} "
+        f"({PREPOSITION_LOOKBACK_DAYS}d)"
+    )
+
+    highs = await _fetch_funding_candles_high(currency, since_ms)
+
+    if len(highs) < PREPOSITION_MIN_SAMPLES:
+        target = PREPOSITION_RATE_FLOOR
+        log(
+            f"Preposition target: window={window_label}, insufficient candle samples "
+            f"({len(highs)} < {PREPOSITION_MIN_SAMPLES}), fallback to floor {target}"
+        )
+        return target, "fallback_floor"
+
+    p99 = _percentile_sorted(highs, 99.0)
+    raw = p99 * PREPOSITION_P99_MULT
+    target = min(max(PREPOSITION_RATE_FLOOR, raw), PREPOSITION_RATE_CEIL)
+    log(
+        f"Preposition target: window={window_label}, "
+        f"p99_high={p99:.8f} * {PREPOSITION_P99_MULT} = {raw:.8f} "
+        f"-> clamp[{PREPOSITION_RATE_FLOOR}, {PREPOSITION_RATE_CEIL}] = {target:.8f} "
+        f"(hourly candles={len(highs)})"
+    )
+    return target, f"p99_high_candles_{len(highs)}"
+
+
+# =============================================================================
+# Spike detection
+# =============================================================================
+
+def detect_spike_level(trades: list, now_ms: int) -> Tuple[int, dict]:
+    """
+    Classify spike level from public trades (assumed to cover ~24h up to now_ms).
+
+    Windows (disjoint):
+      recent   = [now - SPIKE_RECENT_WINDOW_SEC, now]
+      baseline = [now - SPIKE_BASELINE_WINDOW_SEC, now - SPIKE_RECENT_WINDOW_SEC)
+
+    Returns (level, debug_info):
+      0 = no spike
+      1 = L1: recent avg > baseline avg * SPIKE_L1_MULTIPLIER, and >=1 trade with
+            period >= SPIKE_L1_MIN_LONG_PERIOD in the recent window
+      2 = L2: L1 conditions, plus recent max rate >= SPIKE_L2_MIN_RATE, plus
+            >= SPIKE_L2_MIN_LONG_TRADES trades with period >= SPIKE_L2_MIN_LONG_PERIOD
+    """
+    recent_cutoff = now_ms - SPIKE_RECENT_WINDOW_SEC * 1000
+    baseline_cutoff = now_ms - SPIKE_BASELINE_WINDOW_SEC * 1000
+
+    recent_rates: List[float] = []
+    recent_rate_max = 0.0
+    recent_long_l1_count = 0
+    recent_long_l2_count = 0
+    baseline_rates: List[float] = []
+
+    for t in trades:
+        try:
+            mts = int(t[1])
+            rate = float(t[3])
+            period = int(t[4])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if rate <= 0 or mts < baseline_cutoff:
+            continue
+        if mts >= recent_cutoff:
+            recent_rates.append(rate)
+            if rate > recent_rate_max:
+                recent_rate_max = rate
+            if period >= SPIKE_L1_MIN_LONG_PERIOD:
+                recent_long_l1_count += 1
+            if period >= SPIKE_L2_MIN_LONG_PERIOD:
+                recent_long_l2_count += 1
+        else:
+            baseline_rates.append(rate)
+
+    info = {
+        "baseline_n": len(baseline_rates),
+        "recent_n": len(recent_rates),
+        "recent_max": recent_rate_max,
+        "recent_long_l1": recent_long_l1_count,
+        "recent_long_l2": recent_long_l2_count,
+    }
+
+    if not recent_rates or not baseline_rates:
+        info["reason"] = "insufficient samples"
+        return 0, info
+
+    recent_avg = sum(recent_rates) / len(recent_rates)
+    baseline_avg = sum(baseline_rates) / len(baseline_rates)
+    info["recent_avg"] = recent_avg
+    info["baseline_avg"] = baseline_avg
+    info["ratio"] = recent_avg / baseline_avg if baseline_avg > 0 else 0.0
+
+    if baseline_avg <= 0 or recent_avg < baseline_avg * SPIKE_L1_MULTIPLIER:
+        info["reason"] = "ratio below L1 multiplier"
+        return 0, info
+    if recent_long_l1_count < 1:
+        info["reason"] = "no long-tenor trade"
+        return 0, info
+
+    if (
+        recent_rate_max >= SPIKE_L2_MIN_RATE
+        and recent_long_l2_count >= SPIKE_L2_MIN_LONG_TRADES
+    ):
+        info["reason"] = "L2 conditions met"
+        return 2, info
+
+    info["reason"] = "L1 conditions met"
+    return 1, info
+
+
+# =============================================================================
+# Account state
+# =============================================================================
+
+async def get_active_credits(currency: str):
+    """FundingCredit = our funds currently matched and actively earning.
+    Returns None on API failure (caller should skip the round)."""
     try:
-        return bfx.rest.auth.cancel_all_funding_offers(currency)
+        return await asyncio.to_thread(bfx.rest.auth.get_funding_credits, symbol=currency)
     except Exception as e:
-        print(f"Error removing lending offers: {e}")
+        log(f"Error getting funding credits: {e}")
         return None
 
-"""Get available funds"""
-async def get_balance(currency):
+
+async def list_lending_offers(currency: str):
+    """Returns None on API failure (caller should skip the round)."""
     try:
-        wallets: List[Wallet] = bfx.rest.auth.get_wallets()
+        return await asyncio.to_thread(bfx.rest.auth.get_funding_offers, symbol=currency)
+    except Exception as e:
+        log(f"Error getting lending offers: {e}")
+        return None
+
+
+async def get_available_balance(currency: str):
+    """funding wallet available_balance. Returns None on API failure."""
+    try:
+        wallets: List[Wallet] = await asyncio.to_thread(bfx.rest.auth.get_wallets)
         for wallet in wallets:
             if str(wallet.wallet_type).lower() != "funding":
                 continue
             if f"f{wallet.currency}" == currency:
-                return wallet.available_balance
-        return 0
+                return float(wallet.available_balance)
+        return 0.0
     except Exception as e:
-        print(f"Error getting balance: {e}")
-        return 0
-
-
-_CANCEL_REPLACE_THRESHOLD = 0.05  # cancel/replace only if any offer rate deviates >5% from new ladder
-
-
-def _offers_within_ladder(offers, currency: str, rate_avg_dict: dict, rate_upper_dict: dict) -> bool:
-    """Return True if all existing offers are within ±5% of the new ladder range for their bucket."""
-    cur = (currency or "").upper()
-    bucket_for_period = {}
-    for p in (2, 30, 60, 120):
-        bucket_for_period[p] = p
-
-    def _bucket(period: int) -> int | None:
-        if period == 2:
-            return 2
-        if 3 <= period <= 30:
-            return 30
-        if 31 <= period <= 60:
-            return 60
-        if 61 <= period <= 120:
-            return 120
+        log(f"Error getting balance: {e}")
         return None
 
+
+def classify_loans(credits: List[FundingCredit]) -> Dict[str, List[FundingCredit]]:
+    """Split active credits into locked_high_rate vs active_other."""
+    locked: List[FundingCredit] = []
+    other: List[FundingCredit] = []
+    for c in credits or []:
+        try:
+            period = int(c.period)
+            rate = float(c.rate)
+        except (TypeError, ValueError, AttributeError):
+            other.append(c)
+            continue
+        if period >= LOCKED_MIN_PERIOD_DAYS and rate >= LOCKED_MIN_RATE:
+            locked.append(c)
+        else:
+            other.append(c)
+    return {"locked": locked, "other": other}
+
+
+def classify_offers(
+    offers: List[FundingOffer],
+    currency: str,
+    preposition_target_rate: float,
+) -> Dict[str, List[FundingOffer]]:
+    """Split pending offers into 'preposition' (keep) vs 'other' (may cancel).
+
+    Keep rule (asymmetric):
+      period == PREPOSITION_PERIOD AND rate + PREPOSITION_TOLERANCE >= target_rate
+
+    An existing preposition offer priced *above* target_rate is preserved — it
+    can only earn us more if it fills during a spike, and cancelling it to re-list
+    at a lower rate would be self-sabotage. Only offers priced meaningfully
+    *below* target_rate are rotated out.
+    """
+    cur = (currency or "").upper()
+    preposition: List[FundingOffer] = []
+    other: List[FundingOffer] = []
     for o in offers or []:
         sym = getattr(o, "symbol", "") or ""
         if str(sym).upper() != cur:
             continue
         try:
-            rate = float(o.rate)
             period = int(o.period)
-        except (TypeError, ValueError):
-            return False
-        bucket = _bucket(period)
-        if bucket is None:
-            return False
-        lo = rate_avg_dict[bucket] * (1 - _CANCEL_REPLACE_THRESHOLD)
-        hi = rate_upper_dict[bucket] * (1 + _CANCEL_REPLACE_THRESHOLD)
-        if not (lo - 1e-12 <= rate <= hi + 1e-12):
-            print(
-                f"Offer period={period}d rate={rate:.6f} outside ladder "
-                f"[{lo:.6f}, {hi:.6f}] for bucket {bucket}d — will cancel/replace"
-            )
-            return False
-    return True
+            rate = float(o.rate)
+        except (TypeError, ValueError, AttributeError):
+            other.append(o)
+            continue
+        if (
+            period == PREPOSITION_PERIOD
+            and rate + PREPOSITION_TOLERANCE >= preposition_target_rate
+        ):
+            preposition.append(o)
+        else:
+            other.append(o)
+    return {"preposition": preposition, "other": other}
 
 
-def _sum_funding_offer_amounts(offers, currency: str) -> float:
-    cur = (currency or "").upper()
+def _sum_offer_amounts(offers: List[FundingOffer]) -> float:
     total = 0.0
     for o in offers or []:
-        sym = getattr(o, "symbol", "") or ""
-        if str(sym).upper() != cur:
-            continue
         try:
             total += abs(float(o.amount))
         except (TypeError, ValueError):
@@ -533,193 +681,587 @@ def _sum_funding_offer_amounts(offers, currency: str) -> float:
     return total
 
 
-""" Main Function: Strategically place a lending offer on Bitfinex"""
-async def place_lending_offer(currency, margin_split_ratio_dict,rate_avg_dict,offer_rate_guess_upper):
-    """
-    Args:
-        currency (str): The currency to lend (e.g., 'UST', 'USD')
-        margin_split_ratio_dict (dict): ratio of each period
-        rate_avg_dict (dict): average rate of each period
-        offer_rate_guess_upper (dict): upper rate of each period
-    
-    Returns:
-        None
-    """
-    def _submit(amount: float, rate: float, period: int, tail: bool = False):
-        if amount + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
-            print(
-                f"Skip offer amount {amount}: below Bitfinex minimum "
-                f"{BITFINEX_MIN_FUNDING_ORDER_USD} USD or equivalent per order"
-            )
-            return None
-        tag = " (remainder)" if tail else ""
-        print(
-            f"offer rate @{round(rate * 100 * 365,2)} % APY, amount: {amount}, period: {period}{tag}"
-        )
-        try:
-            return bfx.rest.auth.submit_funding_offer(
-                type="LIMIT", symbol=currency, amount=str(amount), rate=rate, period=period
-            )
-        except Exception as e:
-            print(f"Error submitting funding offer: {e}")
-            return None
+# =============================================================================
+# Order builders
+# =============================================================================
 
-    funds = await get_balance(currency)
-    if funds < 1e-6:
-        print(f"Not enough funds to lend, funds: {funds}")
-        return
-    if funds + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
-        print(
-            f"Cannot place funding offers: balance {funds} is below Bitfinex minimum "
-            f"({BITFINEX_MIN_FUNDING_ORDER_USD} USD or equivalent per offer). Add funds to the funding wallet."
-        )
-        return
-    time.sleep(0.5)
+_LADDER_RATE_DECIMALS = 8
+
+
+def _ladder_orders(
+    budget: float,
+    period: int,
+    rate_low: float,
+    rate_high: float,
+) -> List[Tuple[float, float, int]]:
+    """Build a laddered list of (amount, rate, period) orders across [rate_low, rate_high].
+
+    Design:
+      - chunk_floor = max(MINIMUM_FUNDS, BITFINEX_MIN) is the smallest single-order size
+      - target_steps is the stylistic preference (~10 steps, more for large budgets)
+      - feasible_steps = budget // chunk_floor — the actual max number of orders
+      - steps = min(target_steps, feasible_steps); floor at 1 when budget >= min
+      - rates are evenly spaced across [rate_low, rate_high] INCLUDING both endpoints
+        (steps==1 collapses to the midpoint)
+      - any rounding remainder is absorbed into the last order
+    """
+    if budget + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+        return []
 
     chunk_floor = max(MINIMUM_FUNDS, BITFINEX_MIN_FUNDING_ORDER_USD)
-    for period in margin_split_ratio_dict.keys():
-        ratio = margin_split_ratio_dict[period]
-        if ratio < 0.01:
-            continue
-        period_budget = round(funds * ratio, 8)
-        if period_budget + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
-            print(
-                f"Skip period {period}d: budget {period_budget} below minimum "
-                f"{BITFINEX_MIN_FUNDING_ORDER_USD}"
+    target_steps = max(10, math.ceil(budget / _STEPS_MAX_BUCKET_SIZE))
+    feasible_steps = max(1, int(budget // chunk_floor))
+    steps = max(1, min(target_steps, feasible_steps))
+
+    per_step = round(budget / steps, 2)
+    if per_step + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+        # Shouldn't happen given feasible_steps, but guard anyway: collapse to one order.
+        per_step = round(budget, 2)
+        steps = 1
+
+    def _rate_at(i: int) -> float:
+        if steps == 1:
+            return round((rate_low + rate_high) / 2.0, _LADDER_RATE_DECIMALS)
+        frac = i / (steps - 1)
+        return round(rate_low + frac * (rate_high - rate_low), _LADDER_RATE_DECIMALS)
+
+    orders: List[Tuple[float, float, int]] = []
+    allocated = 0.0
+    for i in range(steps):
+        is_last = i == steps - 1
+        amount = round(budget - allocated, 8) if is_last else round(per_step, 8)
+        if amount + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+            # Fold this slice into the previous order's amount.
+            if orders:
+                prev_amt, prev_rate, prev_period = orders[-1]
+                orders[-1] = (round(prev_amt + amount, 8), prev_rate, prev_period)
+            break
+        orders.append((amount, _rate_at(i), period))
+        allocated += amount
+    return orders
+
+
+def _redistribute_sub_minimum_buckets(
+    buckets: List[Tuple[str, float]],
+) -> List[Tuple[str, float]]:
+    """
+    Merge sub-minimum buckets into the preferred destination.
+
+    `buckets[0]` is the preferred destination. Any bucket with amount < Bitfinex
+    minimum gets merged into the preferred destination (keeping funds deployed).
+    If the preferred destination is itself < minimum, we escalate and pour it +
+    everything else into the NEXT bucket in priority order, and so on.
+
+    Returns the filtered list of (name, amount) where every entry is >= minimum.
+    Empty list => even the combined total can't reach the minimum; caller must skip.
+
+    Examples (min=150):
+      [("2d", 210), ("prep", 75)]        -> [("2d", 285)]      # prep swept up
+      [("2d", 140), ("prep", 50)]        -> [("prep", 190)]    # 2d also < min, both escalate
+      [("120d", 350), ("30d", 100), ("2d", 50)] -> [("120d", 500)]  # small slices into 120d
+    """
+    min_order = BITFINEX_MIN_FUNDING_ORDER_USD
+    items = [(name, float(amt)) for name, amt in buckets if amt > 0]
+    if not items:
+        return []
+
+    # Walk from the tail: any sub-min bucket merges into the preferred (index 0).
+    i = len(items) - 1
+    while i >= 1:
+        name, amt = items[i]
+        if amt + 1e-9 < min_order:
+            pref_name, pref_amt = items[0]
+            log(
+                f"Redistribute: bucket '{name}' {amt:.2f} < min {min_order} "
+                f"-> merged into '{pref_name}'"
             )
-            continue
-        steps = max(10, math.ceil(period_budget / _STEPS_MAX_BUCKET_SIZE))
-        available_funds = period_budget
-        splited_fund = max(chunk_floor, round(period_budget / steps, 2))
-        segment_rate = (offer_rate_guess_upper[period] - rate_avg_dict[period]) / steps
-        print(f"Period {period}d: budget={period_budget}, steps={steps}, per_step={splited_fund}")
-        for i in range(1, steps + 1):
-            if available_funds <= 0:
-                break
-            rate = round(rate_avg_dict[period] + i * segment_rate, 5)
-            if i == steps:
-                amt = round(available_funds, 8)
-                if amt + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
-                    _submit(amt, rate, period, tail=True)
-                elif amt > 1e-6:
-                    print(
-                        f"Skip final step {period}d amount {amt}: below Bitfinex minimum order "
-                        f"{BITFINEX_MIN_FUNDING_ORDER_USD}"
-                    )
-                time.sleep(0.1)
-                available_funds = 0
-                break
-            if available_funds < splited_fund:
-                amt = round(available_funds, 8)
-                _submit(amt, rate, period, tail=True)
-                time.sleep(0.1)
-                available_funds = 0
-                break
-            remainder = available_funds - splited_fund
-            if remainder == 0:
-                _submit(splited_fund, rate, period)
-                time.sleep(0.1)
-                available_funds = 0
-                break
-            if remainder + 1e-9 < chunk_floor:
-                merged = round(splited_fund + remainder, 8)
-                if merged + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
-                    _submit(merged, rate, period, tail=True)
-                elif merged > 1e-6:
-                    print(
-                        f"Skip merged {merged}: below Bitfinex minimum order "
-                        f"{BITFINEX_MIN_FUNDING_ORDER_USD}"
-                    )
-                time.sleep(0.1)
-                available_funds = 0
-                break
-            _submit(splited_fund, rate, period)
-            time.sleep(0.1)
-            available_funds = remainder
-        if available_funds > 0:
-            last_rate = round(rate_avg_dict[period] + steps * segment_rate, 5)
-            leftover = round(available_funds, 8)
-            if leftover + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
-                _submit(leftover, last_rate, period, tail=True)
-            else:
-                print(
-                    f"Leftover {leftover} stays in wallet: below Bitfinex minimum order "
-                    f"{BITFINEX_MIN_FUNDING_ORDER_USD}"
-                )
-            time.sleep(0.1)
+            items[0] = (pref_name, pref_amt + amt)
+            items.pop(i)
+        i -= 1
 
-async def lending_bot_strategy():
-    
-    print("Running lending bot strategy")
-    currency = _resolve_fund_currency()
-    # get market sentiment
-    sentiment = await get_market_borrow_sentiment(currency)
-    # get market rate
-    volume_dict,rate_upper_dict,rate_avg_dict = await get_market_funding_book(currency)
+    # If the preferred destination itself is < min, escalate: drop it to the next
+    # surviving bucket, carrying the pooled amount forward.
+    while len(items) >= 2 and items[0][1] + 1e-9 < min_order:
+        pref_name, pref_amt = items[0]
+        next_name, next_amt = items[1]
+        log(
+            f"Redistribute: preferred '{pref_name}' {pref_amt:.2f} < min {min_order} "
+            f"-> escalating into '{next_name}'"
+        )
+        items[1] = (next_name, next_amt + pref_amt)
+        items.pop(0)
 
-    hist_cap = await fetch_funding_hist_high_percentile(currency)
-    try:
-        hist_slack = float(os.getenv("FUNDING_HIST_SLACK_MULT", "1.03"))
-    except ValueError:
-        hist_slack = 1.03
-    hist_slack = max(1.0, min(hist_slack, 1.25))
+    if len(items) == 1 and items[0][1] + 1e-9 < min_order:
+        log(
+            f"Redistribute: sole bucket '{items[0][0]}' {items[0][1]:.2f} still below "
+            f"min {min_order} — caller must skip."
+        )
+        return []
+    return items
 
-    margin_split_ratio_dict, offer_rate_guess_upper = guess_funding_book(
-        currency,
-        volume_dict,
-        rate_upper_dict,
-        rate_avg_dict,
-        sentiment,
-        hist_cap_daily=hist_cap,
-        hist_slack=hist_slack,
+
+def build_base_orders(
+    available_capital: float,
+    preposition_already_placed: float,
+    preposition_target_rate: float,
+    ladder_2d: Tuple[float, float],
+) -> List[Tuple[float, float, int]]:
+    """
+    Base mode: targets are computed against `available_capital` (NOT placed-inclusive),
+    so already-placed preposition does not swell the pool.
+
+      target_2d   = available_capital * BASE_SPLIT_2D
+      target_120d = available_capital * BASE_SPLIT_120D_PREPOSITION
+      reserve     = available_capital * BASE_SPLIT_RESERVE  (stays in wallet)
+
+    Already-placed preposition is then deducted from target_120d to get the topup.
+
+    Fallback priority when sub-minimum: 2d first (easiest to fill).
+    """
+    target_2d = available_capital * BASE_SPLIT_2D
+    target_120d = available_capital * BASE_SPLIT_120D_PREPOSITION
+    preposition_topup = max(0.0, target_120d - preposition_already_placed)
+
+    # Never overspend available_capital (reserve is what's left).
+    if target_2d + preposition_topup > available_capital:
+        # Honor preposition topup first, clip 2d.
+        target_2d = max(0.0, available_capital - preposition_topup)
+
+    log(
+        f"Base mode (pre-redistribute): available={available_capital:.2f} "
+        f"target_2d={target_2d:.2f} target_120d={target_120d:.2f} "
+        f"already_placed={preposition_already_placed:.2f} topup={preposition_topup:.2f}"
     )
 
-    # get my offers and remove current offer first
-    my_offers = await list_lending_offers(currency)
-    print(f"my_offers: {my_offers}")
+    merged = _redistribute_sub_minimum_buckets([
+        ("2d", target_2d),
+        ("preposition_topup", preposition_topup),
+    ])
+    merged_map = dict(merged)
 
-    funds_avail = await get_balance(currency)
-    locked_in_offers = _sum_funding_offer_amounts(my_offers, currency)
-    funds_ready = funds_avail + locked_in_offers
-    if funds_ready + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
-        print(
-            f"Skip cancel/replace: deployable after cancel {funds_ready} "
-            f"(available {funds_avail}, in_offers {locked_in_offers}) is below Bitfinex minimum offer "
-            f"{BITFINEX_MIN_FUNDING_ORDER_USD} USD equivalent — would leave offers empty with no valid replacement."
+    orders: List[Tuple[float, float, int]] = []
+    topup_final = merged_map.get("preposition_topup", 0.0)
+    actual_2d_final = merged_map.get("2d", 0.0)
+
+    if topup_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+        orders.append((round(topup_final, 8), preposition_target_rate, PREPOSITION_PERIOD))
+    if actual_2d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+        orders.extend(
+            _ladder_orders(
+                actual_2d_final,
+                period=2,
+                rate_low=ladder_2d[0],
+                rate_high=ladder_2d[1],
+            )
+        )
+    return orders
+
+
+def build_spike_orders(
+    available_capital: float,
+    level: int,
+    preposition_already_placed: float,
+    preposition_target_rate: float,
+    ladder_2d: Tuple[float, float],
+    ladder_30d: Tuple[float, float],
+) -> List[Tuple[float, float, int]]:
+    """
+    Spike mode: targets computed against `available_capital` by the level split.
+
+      target_Xd = available_capital * SPIKE_SPLIT_L{level}[X]   for X in {2, 30, 120}
+      topup_120d = max(0, target_120d - preposition_already_placed)
+
+    If topup_120d < target_120d (preposition already covers some), the savings
+    stay as-is — we don't re-inflate 2d/30d. 2d/30d budgets are fresh shares of
+    available, capped so 2d+30d+topup_120d <= available.
+
+    Fallback priority when sub-minimum: 120d > 30d > 2d (favor long tenor).
+    """
+    split = SPIKE_SPLIT_L1 if level == 1 else SPIKE_SPLIT_L2
+
+    target_2d = available_capital * split[2]
+    target_30d = available_capital * split[30]
+    target_120d = available_capital * split[120]
+    topup_120d = max(0.0, target_120d - preposition_already_placed)
+
+    # Cap 2d + 30d so we don't overcommit available_capital.
+    slot_for_short = max(0.0, available_capital - topup_120d)
+    short_target_sum = target_2d + target_30d
+    if short_target_sum > slot_for_short and short_target_sum > 0:
+        shrink = slot_for_short / short_target_sum
+        target_2d *= shrink
+        target_30d *= shrink
+
+    log(
+        f"Spike L{level} (pre-redistribute): available={available_capital:.2f} "
+        f"split={split} target_2d={target_2d:.2f} target_30d={target_30d:.2f} "
+        f"target_120d={target_120d:.2f} topup_120d={topup_120d:.2f} "
+        f"preposition_placed={preposition_already_placed:.2f}"
+    )
+
+    merged = _redistribute_sub_minimum_buckets([
+        ("120d_topup", topup_120d),
+        ("30d", target_30d),
+        ("2d", target_2d),
+    ])
+    merged_map = dict(merged)
+
+    orders: List[Tuple[float, float, int]] = []
+    topup_120d_final = merged_map.get("120d_topup", 0.0)
+    budget_30d_final = merged_map.get("30d", 0.0)
+    budget_2d_final = merged_map.get("2d", 0.0)
+
+    if topup_120d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+        orders.append((round(topup_120d_final, 8), preposition_target_rate, PREPOSITION_PERIOD))
+    if budget_30d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+        orders.extend(
+            _ladder_orders(
+                budget_30d_final,
+                period=30,
+                rate_low=ladder_30d[0],
+                rate_high=ladder_30d[1],
+            )
+        )
+    if budget_2d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+        orders.extend(
+            _ladder_orders(
+                budget_2d_final,
+                period=2,
+                rate_low=ladder_2d[0],
+                rate_high=ladder_2d[1],
+            )
+        )
+    return orders
+
+
+# =============================================================================
+# Order submission
+# =============================================================================
+
+async def _submit_offer(currency: str, amount: float, rate: float, period: int) -> bool:
+    """Returns True on success, False on failure/skip."""
+    if amount + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+        log(f"Skip offer amount {amount}: below minimum {BITFINEX_MIN_FUNDING_ORDER_USD}")
+        return False
+    amount_str = f"{amount:.8f}"
+    log(
+        f"{'[DRY_RUN] ' if DRY_RUN else ''}"
+        f"Submit: period={period}d rate={rate:.6f} (~{rate * 365 * 100:.2f}% APY) "
+        f"amount={amount_str}"
+    )
+    if DRY_RUN:
+        return True
+    try:
+        await asyncio.to_thread(
+            bfx.rest.auth.submit_funding_offer,
+            type="LIMIT", symbol=currency, amount=amount_str, rate=rate, period=period,
+        )
+        return True
+    except Exception as e:
+        log(f"Error submitting offer: {e}")
+        return False
+
+
+async def _cancel_offer(offer: FundingOffer) -> bool:
+    """Returns True on success, False on failure."""
+    try:
+        oid = int(offer.id)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    log(
+        f"{'[DRY_RUN] ' if DRY_RUN else ''}"
+        f"Cancel offer id={oid} period={offer.period}d rate={offer.rate} "
+        f"amount={offer.amount}"
+    )
+    if DRY_RUN:
+        return True
+    try:
+        await asyncio.to_thread(bfx.rest.auth.cancel_funding_offer, id=oid)
+        return True
+    except Exception as e:
+        log(f"Error cancelling offer {oid}: {e}")
+        return False
+
+
+# =============================================================================
+# Main strategy loop
+# =============================================================================
+
+# Tolerances used by _plan_matches_existing.
+_PLAN_DIFF_RATE_DECIMALS = 5       # round rate to this many decimals when bucketing
+_PLAN_DIFF_REL_TOLERANCE = 0.05    # 5% per-bucket amount tolerance
+_PLAN_DIFF_ABS_TOLERANCE = 20.0    # 20 USD floor, so small absolute drift still triggers merge
+
+
+def _plan_matches_existing(
+    existing_offers: List[FundingOffer],
+    new_orders: List[Tuple[float, float, int]],
+) -> bool:
+    """
+    Return True if cancelling existing_offers to place new_orders would be a no-op:
+      - Same (period, rounded-rate) bucket set on both sides
+      - Each bucket's total amount differs by <= max(5%, 20 USD)
+
+    Used to skip the cancel+resubmit dance when the market hasn't meaningfully
+    moved. Preposition offers are classified out before this check, so we're
+    only comparing the laddered / spike buckets.
+    """
+    def _bucketize_offers(offers: List[FundingOffer]) -> Dict[Tuple[int, float], float]:
+        out: Dict[Tuple[int, float], float] = {}
+        for o in offers or []:
+            try:
+                period = int(o.period)
+                rate = float(o.rate)
+                amount = abs(float(o.amount))
+            except (TypeError, ValueError, AttributeError):
+                return {}  # any malformed offer forces a re-plan
+            key = (period, round(rate, _PLAN_DIFF_RATE_DECIMALS))
+            out[key] = out.get(key, 0.0) + amount
+        return out
+
+    def _bucketize_plan(orders: List[Tuple[float, float, int]]) -> Dict[Tuple[int, float], float]:
+        out: Dict[Tuple[int, float], float] = {}
+        for amount, rate, period in orders or []:
+            key = (period, round(rate, _PLAN_DIFF_RATE_DECIMALS))
+            out[key] = out.get(key, 0.0) + amount
+        return out
+
+    existing = _bucketize_offers(existing_offers)
+    planned = _bucketize_plan(new_orders)
+
+    if existing.keys() != planned.keys():
+        return False
+
+    for key, planned_amt in planned.items():
+        existing_amt = existing[key]
+        diff = abs(existing_amt - planned_amt)
+        tol = max(_PLAN_DIFF_ABS_TOLERANCE, planned_amt * _PLAN_DIFF_REL_TOLERANCE)
+        if diff > tol:
+            return False
+    return True
+
+
+def _scale_orders_to_cap(
+    orders: List[Tuple[float, float, int]], cap: float
+) -> List[Tuple[float, float, int]]:
+    """Proportionally shrink order amounts so their sum <= cap. When a scaled
+    amount falls below Bitfinex min, merge it into the last surviving order of
+    the same period (or the overall last survivor) so no budget is silently
+    dropped. If no order survives (cap itself below min), returns []."""
+    total = sum(a for a, _r, _p in orders)
+    if total <= cap + 1e-9 or total <= 0:
+        return orders
+    shrink = cap / total
+    scaled: List[Tuple[float, float, int]] = []
+    leftover = 0.0
+    for amount, rate, period in orders:
+        new_amount = round(amount * shrink, 8)
+        if new_amount + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
+            scaled.append((new_amount, rate, period))
+        else:
+            leftover += new_amount
+    if leftover > 0 and scaled:
+        # Prefer merging into the last survivor of the same period; fall back to the overall last.
+        merge_idx = len(scaled) - 1
+        for i in range(len(scaled) - 1, -1, -1):
+            if scaled[i][2] == orders[-1][2]:
+                merge_idx = i
+                break
+        amt, rate, period = scaled[merge_idx]
+        scaled[merge_idx] = (round(amt + leftover, 8), rate, period)
+    log(
+        f"Scaled orders: total {total:.2f} -> cap {cap:.2f} (factor {shrink:.4f})"
+        + (f", merged leftover {leftover:.2f} into surviving order" if leftover > 0 and scaled else "")
+        + (f", dropped {leftover:.2f} (no survivor)" if leftover > 0 and not scaled else "")
+    )
+    return scaled
+
+
+async def lending_bot_strategy():
+    log("=" * 60)
+    log(f"Running lending bot strategy (DRY_RUN={DRY_RUN})")
+    currency = _resolve_fund_currency()
+    now_ms = int(time.time() * 1000)
+
+    # 1. Snapshot account state — if any of these fail, SKIP this round (don't act blind).
+    credits = await get_active_credits(currency)
+    offers = await list_lending_offers(currency)
+    wallet_avail = await get_available_balance(currency)
+    if credits is None or offers is None or wallet_avail is None:
+        log("Skip: failed to fetch account state; leaving offers untouched.")
+        return
+
+    # 2. Early skip: if no usable capital at all, bail BEFORE hitting candle / book APIs.
+    #    Rough upper bound on cancellable offers = everything that's NOT a PREPOSITION_PERIOD
+    #    tenor. This is a conservative lower-bound on available_capital (the real
+    #    classify_offers later may keep even fewer as preposition, so actual capital
+    #    can only be >= this). If even this is below min, no amount of recomputation
+    #    will help.
+    rough_cancellable = sum(
+        abs(float(o.amount))
+        for o in (offers or [])
+        if getattr(o, "period", None) != PREPOSITION_PERIOD
+    )
+    rough_capital = wallet_avail + rough_cancellable
+    if rough_capital + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+        log(
+            f"Skip (early): rough available_capital {rough_capital:.2f} "
+            f"(wallet={wallet_avail:.2f} + non-preposition offers={rough_cancellable:.2f}) "
+            f"below minimum {BITFINEX_MIN_FUNDING_ORDER_USD}; leaving offers untouched."
         )
         return
 
-    n_active = sum(1 for r in margin_split_ratio_dict.values() if r >= 0.01)
-    if n_active > 1 and not _split_buckets_all_meet_min(
-        funds_ready, margin_split_ratio_dict, BITFINEX_MIN_FUNDING_ORDER_USD
-    ):
-        print(
-            f"Multi-tenor split would leave each bucket below min order "
-            f"{BITFINEX_MIN_FUNDING_ORDER_USD}; fallback 100% 2d (balance {funds_ready})."
+    classified_loans = classify_loans(credits)
+    locked = classified_loans["locked"]
+    active_other = classified_loans["other"]
+    locked_amount = sum(abs(float(c.amount)) for c in locked)
+    other_amount = sum(abs(float(c.amount)) for c in active_other)
+    log(
+        f"Loans: locked_high_rate={len(locked)} ({locked_amount:.2f}) "
+        f"active_other={len(active_other)} ({other_amount:.2f})"
+    )
+    for c in locked:
+        log(
+            f"  LOCKED id={c.id} period={c.period}d rate={c.rate:.6f} "
+            f"amount={abs(float(c.amount)):.2f}"
         )
-        margin_split_ratio_dict = {2: 1.0, 30: 0.0, 60: 0.0, 120: 0.0}
 
-    time.sleep(0.5)
-    cancel_res = await remove_all_lending_offer(currency[1:])
-    print(f"cancel_res: {cancel_res}")
+    # 3. Preposition target rate (hourly candle HIGHs, separate fetch — could be cached later).
+    preposition_target_rate, _src = await compute_preposition_target_rate(currency)
 
-    # place new offer
-    time.sleep(0.5)
-    await place_lending_offer(currency, margin_split_ratio_dict,rate_avg_dict,offer_rate_guess_upper)
-    
+    # 4. Classify pending offers — preposition stays in place, others may be cancelled.
+    classified_offers = classify_offers(offers, currency, preposition_target_rate)
+    preposition_offers = classified_offers["preposition"]
+    other_offers = classified_offers["other"]
+    preposition_amount = _sum_offer_amounts(preposition_offers)
+    other_offers_amount = _sum_offer_amounts(other_offers)
+    log(
+        f"Offers: preposition(keep)={len(preposition_offers)} ({preposition_amount:.2f}) "
+        f"other(cancel-candidates)={len(other_offers)} ({other_offers_amount:.2f})"
+    )
+
+    # 5. available_capital = wallet + offers we're about to cancel.
+    available_capital = wallet_avail + other_offers_amount
+    log(
+        f"Capital: wallet={wallet_avail:.2f} cancellable_offers={other_offers_amount:.2f} "
+        f"-> available_capital={available_capital:.2f}"
+    )
+    if available_capital + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
+        log(
+            f"Skip: available_capital {available_capital:.2f} below minimum "
+            f"{BITFINEX_MIN_FUNDING_ORDER_USD}; leaving existing offers untouched."
+        )
+        return
+
+    # 6. Shared 24h public trades feed (spike detection + ladder range).
+    baseline_since_ms = now_ms - SPIKE_BASELINE_WINDOW_SEC * 1000
+    trades_24h = await _fetch_public_trades(currency, baseline_since_ms)
+
+    # 7. Book-derived fallback ranges for ladders (when trade samples are thin).
+    _vol, book_rate_upper, book_rate_avg = await get_market_funding_book(currency)
+    ladder_2d = compute_ladder_range(
+        trades_24h, period_min=2, period_max=2,
+        book_fallback_low=book_rate_avg[2], book_fallback_high=book_rate_upper[2],
+    )
+    ladder_30d = compute_ladder_range(
+        trades_24h, period_min=3, period_max=30,
+        book_fallback_low=book_rate_avg[30], book_fallback_high=book_rate_upper[30],
+    )
+
+    # 8. Spike detection.
+    spike_level, spike_info = detect_spike_level(trades_24h, now_ms=now_ms)
+    log(f"Spike detection: level={spike_level} info={spike_info}")
+
+    # 9. Build new orders.
+    if spike_level == 0:
+        new_orders = build_base_orders(
+            available_capital=available_capital,
+            preposition_already_placed=preposition_amount,
+            preposition_target_rate=preposition_target_rate,
+            ladder_2d=ladder_2d,
+        )
+    else:
+        new_orders = build_spike_orders(
+            available_capital=available_capital,
+            level=spike_level,
+            preposition_already_placed=preposition_amount,
+            preposition_target_rate=preposition_target_rate,
+            ladder_2d=ladder_2d,
+            ladder_30d=ladder_30d,
+        )
+
+    if not new_orders:
+        log("No new orders to place this round; keeping existing preposition offers.")
+        return
+
+    # 10. No-op check: if current other_offers already match the plan closely,
+    #     skip cancel+resubmit to avoid losing queue priority every minute.
+    if _plan_matches_existing(other_offers, new_orders):
+        log(
+            f"Skip: existing {len(other_offers)} offers already match the plan "
+            f"(within {int(_PLAN_DIFF_REL_TOLERANCE * 100)}% / {_PLAN_DIFF_ABS_TOLERANCE} USD). "
+            f"No cancel/resubmit."
+        )
+        return
+
+    # 11. Cancel non-preposition offers (preposition is never touched here).
+    cancel_attempts = len(other_offers)
+    cancel_successes = 0
+    for o in other_offers:
+        if await _cancel_offer(o):
+            cancel_successes += 1
+        await asyncio.sleep(0.1)
+    cancel_failures = cancel_attempts - cancel_successes
+    log(f"Cancel summary: {cancel_successes}/{cancel_attempts} succeeded ({cancel_failures} failed)")
+
+    await asyncio.sleep(0.5)
+
+    # 12. Before submitting, re-fetch wallet to confirm what really freed up.
+    #     If some cancels silently failed, wallet will be smaller than expected and we
+    #     must scale down the new orders rather than over-commit.
+    if not DRY_RUN:
+        actual_wallet = await get_available_balance(currency)
+    else:
+        actual_wallet = available_capital
+    if actual_wallet is None:
+        log("Skip submit: failed to re-check wallet after cancels.")
+        return
+    log(f"Post-cancel wallet: {actual_wallet:.2f} (expected ~{available_capital:.2f})")
+
+    submit_cap = actual_wallet - 1.0  # small safety buffer for fees / rounding
+    new_orders = _scale_orders_to_cap(new_orders, submit_cap)
+    if not new_orders:
+        log("No orders remain after scale-down; wallet too small this round.")
+        return
+
+    # 13. Submit new orders.
+    submit_successes = 0
+    submit_attempts = len(new_orders)
+    for amount, rate, period in new_orders:
+        if await _submit_offer(currency, amount, rate, period):
+            submit_successes += 1
+        await asyncio.sleep(0.1)
+    log(
+        f"Round summary: cancelled={cancel_successes}/{cancel_attempts} "
+        f"submitted={submit_successes}/{submit_attempts}"
+    )
+
 
 async def run_schedule_task():
-    await lending_bot_strategy()
+    try:
+        await lending_bot_strategy()
+    except Exception as e:
+        log(f"Strategy run failed: {e}")
 
 
 if __name__ == '__main__':
+    setup()
     mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     if mode == 0:
         asyncio.run(run_schedule_task())
     else:
-        schedule.every(2).minutes.do(lambda: asyncio.run(run_schedule_task()))
+        schedule.every(1).minutes.do(lambda: asyncio.run(run_schedule_task()))
         asyncio.run(run_schedule_task())
         while True:
             schedule.run_pending()
             time.sleep(1)
-

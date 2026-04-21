@@ -5,24 +5,54 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run Funding Bot",
+            "name": "Run Funding Bot (once)",
             "type": "debugpy",
-            "python":"/Users/kang/opt/anaconda3/envs/bf/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "request": "launch",
             "program": "${workspaceFolder}/start.py",
             "args": ["0"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Run Funding Bot (once, DRY_RUN)",
+            "type": "debugpy",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "request": "launch",
+            "program": "${workspaceFolder}/start.py",
+            "args": ["0"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "DRY_RUN": "1"
+            },
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
             "name": "Start Funding Bot Service",
             "type": "debugpy",
-            "python":"/Users/kang/opt/anaconda3/envs/bf/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "request": "launch",
             "program": "${workspaceFolder}/start.py",
             "args": ["1"],
+            "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": false
         },
+        {
+            "name": "Start Funding Bot Service (DRY_RUN)",
+            "type": "debugpy",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/start.py",
+            "request": "launch",
+            "args": ["1"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "DRY_RUN": "1"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
     ]
 }

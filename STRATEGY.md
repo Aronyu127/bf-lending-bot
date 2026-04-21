@@ -1,136 +1,206 @@
-# 融資策略方向（資料驅動）
+# 融資策略方向（資金分層 + 只動可動資金）
 
 ## 目標
 
-在 **Bitfinex funding** 上，於可自動化範圍內 **盡量提高實際年化收益**。  
-歷史公開 K 線無法還原「你的掛單是否成交」，因此策略以 **市場結構**（尖峰短、肥尾、fUST 整體低於 fUSD）為依據，並保留 `.env` 可調參數。
+在 **Bitfinex funding** 上，於可自動化範圍內 **盡量提高實際年化收益**，核心原則：
 
-## 歷史資料結論（`scripts/analyze_funding_history.py`）
+1. **已經成功借出的高利率長單 = 成果池，不動**
+2. **只有可重新部署的閒置資金，才進入 base / preposition / spike 計算**
+3. **盡量讓資金留在高利率長天期（120d）**
+4. **高利率 spike 可能只有幾秒到幾分鐘，所以平常就預掛一部分 120d 作為「等待網」**
+5. **預掛單不頻繁重掛，避免一直重排隊**
 
-- **成交區間 HIGH（年化）** 多數時間不算極高，但 **少數小時極端上冲**（肥尾）。
-- **尖峰延續通常很短**（連續高檔往往只有數小時量級），因此 **保留足夠 2 天期資金** 有利於連續參與多波尖峰；長天期仍用於 **鎖住「真的很高」的區段**。
-- **fUST** 的歷史高檔整體 **低於 fUSD**，高利率門檻應 **分幣種** 預設，否則 UST 幾乎永遠進不了「高利率模式」或反之過度觸發。
+---
 
-## 程式已對齊的方向
+## 一、資金分層
 
-1. **梯子最高利率與盤口最高掛單對齊**  
-   每個天期桶的梯子頂 = `max(模型估計頂, 該桶 order book 最高利率)`，避免加權平均壓低梯頂、錯過簿上已存在的高價。
+每輪執行時，帳戶資金分成三類：
 
-2. **以近期公開 K 線 HIGH 分位壓住離譜梯頂**  
-   預設：每次策略執行拉 **12 小時** `a30:p2:p30` K 線，取 **最近 8 根（預設排除未收線的最後一根）** 的 **HIGH**，再對這 8 個值取 **分位數**（預設約 p92）當參考日利率，乘 **slack** 作為各天期梯子頂 **上限**。  
-   若 `FUNDING_HIST_INTERVAL=1h`，則改回 **過去 N 天、1 小時** 全樣本取分位（`FUNDING_HIST_LOOKBACK_DAYS`，且需至少 48 根）。  
-   套用上限後會 **重算** 是否進入高利率拆桶。`FUNDING_HIST_DISABLE=1` 可關閉歷史壓頂。
+| 類別 | 定義 | 處理方式 |
+|------|------|---------|
+| **locked_high_rate_loans** | active credit 且 `period ≥ LOCKED_MIN_PERIOD_DAYS` 且 `rate ≥ LOCKED_MIN_RATE` | 不動、不列入配比計算、僅在到期 / 提前還款 / 狀態變化時才離開此類 |
+| **active_other_loans** | 其他 active credits（2d、低利率長單等） | 不動，等自然到期釋出 |
+| **available_capital** | `wallet.available_balance` + 「可撤的非 preposition 掛單金額」 | 唯一需要重新分配的資金池 |
 
-3. **高利率門檻 `HIGH_RATE_APY_MIN`（年化 %）**  
-   - 未設定環境變數時：**fUSD 預設 20%**、**fUST 預設 17.5%**。  
-   - 若設 `HIGH_RATE_APY_MIN`，則 **完全覆寫** 上述預設。
+注意：所有百分比都是對 `available_capital` 算，**不是** 對總資產算。
 
-4. **高利率時的資金配比（預設）**  
-   **2d : 30d : 60d : 120d = 0.30 : 0.15 : 0 : 0.55**（可用 `HIGH_RATE_MARGIN_SPLIT` 覆寫）。  
-   **2 天 ≤30%** 留給追逐尖峰；**120 天為主** 求較穩定收益，其餘給 **30 天** 過渡。
+---
 
-5. **梯子寬度**  
-   `RATE_ADJUSTMENT_RATIO` 預設 **1.11**（可用環境變數覆寫），略增最高階與均價的距離，方便在肥尾區補上更高檔掛單；若過難成交可再調回 1.10。
+## 二、策略模式
 
-## 環境變數（摘要）
+每輪：先決定 spike level，再決定怎麼分配 `available_capital`。
 
-| 變數 | 用途 |
-|------|------|
-| `FUND_CURRENCY` | `fUSD` / `fUST`（影響預設門檻） |
-| `HIGH_RATE_APY_MIN` | 覆寫高利率門檻（年化 %） |
-| `HIGH_RATE_MARGIN_SPLIT` | 四個比例：2,30,60,120 天 |
-| `RATE_ADJUSTMENT_RATIO` | 梯子倍率基底（與 `STEPS` 同用） |
-| `STEPS` / `highest_sentiment` | 仍於 `start.py` 常數區修改 |
-| `FUNDING_HIST_INTERVAL` | `12h`（預設）或 `1h`（長窗 + `LOOKBACK_DAYS`） |
-| `FUNDING_HIST_BAR_COUNT` | 12h 模式下使用最近 **根數**（預設 8） |
-| `FUNDING_HIST_INCLUDE_FORMING` | 設 `1` / `true` 則 **保留** 未收線最後一根（預設排除） |
-| `FUNDING_HIST_LOOKBACK_DAYS` | 僅 `INTERVAL=1h`：回看天數（預設 45，範圍 7～120） |
-| `FUNDING_HIST_PERCENTILE` | HIGH 分位數（預設 92；12h 下對最近 N 根 HIGH 計算） |
-| `FUNDING_HIST_SLACK_MULT` | 分位數上限再乘的係數（預設 1.03，上限 1.25） |
-| `FUNDING_HIST_DISABLE` | 設 `1` / `true` 則不用歷史壓頂 |
+### Spike level 0（無 spike） — Base mode
 
-## 掛單邏輯說明（含範例）
+| 桶 | 佔 available_capital | 說明 |
+|----|---------------------|------|
+| 2d（ladder） | `BASE_SPLIT_2D` = 70% | 市場均價到估計頂，分 10 階梯子 |
+| 120d preposition | `BASE_SPLIT_120D_PREPOSITION` = 25% | 單一大單 @ `preposition_target_rate` |
+| reserve（機動） | `BASE_SPLIT_RESERVE` = 5% | 留在 wallet，不掛 |
 
-### 整體流程
+### Spike level 1（一般 spike）
+
+| 桶 | 佔 available_capital |
+|----|---------------------|
+| 2d | 40% |
+| 30d | 20% |
+| 120d（含 preposition）| 40% |
+
+### Spike level 2（強 spike）
+
+| 桶 | 佔 available_capital |
+|----|---------------------|
+| 2d | 10% |
+| 30d | 20% |
+| 120d（含 preposition）| 70% |
+
+**共通規則**：已經在場上的 preposition 120d 掛單會抵掉 120d 桶的預算，只補差額，不重下整桶。
+
+---
+
+## 三、Preposition 目標利率
+
+以最近 3 天 hourly funding candle（`trade:1h:{currency}:a30:p2:p30`）的 HIGH 計算 p99，套用：
 
 ```
-每次執行
-  1. 拉市場 order book → 算各天期 ravg / upper
-  2. 拉 funding stats → 算市場情緒 sentiment
-  3. 拉歷史 K 線 HIGH 分位 → 算 hist_cap（壓離譜梯頂）
-  4. 計算梯子：margin_split_ratio_dict + offer_rate_guess_upper
-  5. 檢查現有掛單是否還在梯子範圍內
-     → 都在：跳過，不撤不掛
-     → 有偏離：全撤，重新掛梯子
+target_rate = clamp(p99_hourly_high × 0.98, [floor, ceil])
+           = min(max(0.00040, p99_hourly_high × 0.98), 0.00048)
 ```
 
----
+意義：
+- **不低於 0.00040** — 0.00040 已經是滿意的高價位
+- **跟著市場高價區浮動** — p99 * 0.98，略低於極端值
+- **不超過 0.00048** — 避免被單次異常 spike 把掛價拉太高
+- **用 candle HIGH 而非每筆 trade** — HIGH 本身就是每小時的峰值，正好對應「預掛在高價區」的意圖；且 candle 端點不會被 10000 筆 trade 上限截斷
 
-### 梯子是什麼
+資料不足或 API 失敗時 fallback 到 `PREPOSITION_RATE_FLOOR`（保守）。
 
-「梯子」就是這次要掛的一組利率不同的掛單。
+### Preposition 留在場上的保留規則（不對稱）
 
-Bot 不會只掛一張單，而是把資金切成 10 等份，從低到高掛 10 個不同利率。目的是：
-- **低的幾張**：利率接近市場均價，比較容易被借走，讓資金不要閒置太久
-- **高的幾張**：利率接近市場最高價，萬一市場突然拉高，還有機會吃到高利率
+現有 preposition 掛單（`period == PREPOSITION_PERIOD` 且 `rate + PREPOSITION_TOLERANCE ≥ target_rate`）**不撤**。
 
-舉例（2d 桶，3,000 UST，市場均價淨 APR 約 12%，目標最高淨 APR 約 26%）：
+**不對稱設計**：
+- 掛得比目標**高**的單 → 保留。高單只會在 spike 時被吃到，成交等於多賺；主動撤掉改掛低價等於自己壓低報價
+- 掛得比目標**低**（超過 tolerance）的單 → 撤掉重掛。低單成交會讓我們少賺，必須重配
 
-| 張數 | 淨 APR | 金額 | 說明 |
-|------|--------|------|------|
-| 第 1 張 | 13.7% | 300 | 最接近市場均價，最容易成交 |
-| 第 2 張 | 15.0% | 300 | ↑ |
-| 第 3 張 | 16.5% | 300 | ↑ |
-| ... | ... | ... | 依序往上 |
-| 第 10 張 | 26.1% | 300 | 最高價，等市場拉高才會成交 |
-
-這樣的好處是：不會因為判斷錯利率高低，讓全部資金卡在一個掛不出去的價格上。
+tolerance 仍保留小緩衝，避免 target_rate 在 1-2bp 間微幅漂移就來回重掛。
 
 ---
 
-### 普通模式 vs 高利率模式
+## 四、Spike 判定邏輯
 
-Bot 每次執行會先判斷「現在市場利率算不算高」：
+資料來源：`/v2/trades/{currency}/hist`（公開成交），拉最近 24h。
 
-**普通模式**（市場利率偏低，淨 APR < 14.875%）
-- 全部資金都掛 **2 天期**
-- 原因：利率不高，不值得鎖長天期，保持彈性、快速重定價比較重要
+### Level 1（一般 spike）
 
-**高利率模式**（市場利率夠高，淨 APR ≥ 14.875%）
-- 資金拆成三塊：**2d 30% / 30d 15% / 120d 55%**
-- 原因：現在利率值得鎖住，55% 放 120 天鎖利率；但還是留 30% 在 2 天期，繼續追尖峰
+- 最近 1 分鐘平均成交利率 > 過去 24h 平均 × `SPIKE_L1_MULTIPLIER`（預設 1.8）
+- **且** 最近 1 分鐘內出現至少 1 筆 `period ≥ SPIKE_L1_MIN_LONG_PERIOD`（預設 30d）的成交
 
-舉例：
+### Level 2（強 spike）
 
-| 情境 | 2d 梯頂淨 APR | 模式 | 資金分配 |
-|------|-------------|------|---------|
-| 市場平靜，沒什麼人借 | 12% | 普通模式 | 全部 2d |
-| 市場活躍，大家搶著借 | 26% | 高利率模式 | 2d 30% / 30d 15% / 120d 55% |
+- 滿足 L1 所有條件
+- **且** 最近 1 分鐘最高成交利率 ≥ `SPIKE_L2_MIN_RATE`（預設 0.00035）
+- **且** 最近 1 分鐘內出現 ≥ `SPIKE_L2_MIN_LONG_TRADES`（預設 2）筆 `period ≥ SPIKE_L2_MIN_LONG_PERIOD`（預設 120d）的成交
+
+Spike **只影響這輪 `available_capital` 的配比**，不會重撤 locked loans 或 preposition。
 
 ---
 
-### 撤單條件：什麼時候才重新掛
+## 五、Fallback：sub-minimum bucket 合併
 
-Bot 不是每次執行都無條件撤掉舊單重掛，而是先檢查「現有的掛單還合不合理」。
+當 `available_capital` 太小，切完配比後某個桶 < Bitfinex 最小下限（預設 150 USD）時，該桶會被合併到「首選桶」：
 
-判斷邏輯：
-- 看每張現有掛單的利率，跟這次算出來的梯子範圍比較
-- 如果利率還在合理範圍內（市場均價 ±5% 到最高價 ±5% 之間）→ 不動，省下撤單成本
-- 如果有任何一張明顯偏離（例如之前掛的利率太低，跟現在市場差很多）→ 全撤重掛
+- **Base mode**：首選 = 2d（快成交優先）。若 preposition topup < 150 → 併入 2d。
+- **Spike mode**：首選 = 120d（長天期優先）。若 2d/30d < 150 → 併入 120d。
 
-舉例（2d 桶，這次算出合理範圍是淨 APR 約 11.6% ~ 27.4%）：
-
-| 掛單 | 利率（淨 APR） | 結果 | 原因 |
-|------|-------------|------|------|
-| A    | 22%         | 保留 | 在合理範圍內 |
-| B    | 6%          | 撤單 | 太低，市場早就超過這個價格了 |
-| C    | 25%         | 保留 | 在合理範圍內 |
-
-B 偏離太多，觸發全撤，三張都重新掛。
+若首選桶自己也 < 150，則全部金額連同滾入下一優先桶；全部桶合併後仍 < 150，則本輪 skip，錢留 wallet，**不會誤撤任何掛單**。
 
 ---
 
-## 後續可強化（尚未實作）
+## 六、主流程
 
-- 以 **ledger 實際利息** 與掛單 log 做 **回放／參數掃描**，估計給定門檻與配比的長期 APY。
-- **儀表板**：顯示「當次是否高利率模式、梯子頂 APY、觸發門檻」便於校準。
+```
+每次執行：
+  1. 抓 active credits / pending offers / wallet balance
+  2. classify_loans → locked_high_rate / active_other（此二類不動）
+  3. compute_preposition_target_rate（近 N 天 hourly candle HIGH 的 p99）
+  4. classify_offers → preposition（keep）/ other（可撤候選）
+  5. available_capital = wallet + sum(other_offers)
+  6. 拉 24h 公開成交 → detect_spike_level → 0 / 1 / 2
+  7. build_base_orders 或 build_spike_orders（依 level）
+  8. 逐一取消 other_offers（不動 preposition）
+  9. 逐一送出新單
+```
+
+**絕不做的事**：
+- 取消 preposition 容忍帶內的掛單
+- 重配整戶資金
+- 因 spike 就撤已成交的 locked 高息長單
+- 丟掉 sub-minimum 金額讓它死在 wallet（有 fallback 合併）
+
+---
+
+## 七、環境變數
+
+### 資金分層
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `LOCKED_MIN_PERIOD_DAYS` | 60 | locked 判定的最小天期 |
+| `LOCKED_MIN_RATE` | 0.00040 | locked 判定的最小利率 |
+
+### Base mode 配比
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `BASE_SPLIT_2D` | 0.70 | 2d 佔比 |
+| `BASE_SPLIT_120D_PREPOSITION` | 0.25 | 預掛 120d 佔比 |
+| `BASE_SPLIT_RESERVE` | 0.05 | 機動資金佔比 |
+
+### Preposition
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `PREPOSITION_PERIOD` | 120 | 預掛天期 |
+| `PREPOSITION_RATE_FLOOR` | 0.00040 | target_rate 下限 |
+| `PREPOSITION_RATE_CEIL` | 0.00048 | target_rate 上限 |
+| `PREPOSITION_P99_MULT` | 0.98 | 對 p99 的乘數 |
+| `PREPOSITION_LOOKBACK_DAYS` | 3 | p99 採樣的回看天數（hourly candle）|
+| `PREPOSITION_TOLERANCE` | 0.00002 | 保留現有預掛單的利率容忍帶 |
+
+### Spike 判定
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `SPIKE_L1_MULTIPLIER` | 1.8 | L1 觸發：recent-1m / 24h-avg 比值 |
+| `SPIKE_L1_MIN_LONG_PERIOD` | 30 | L1 需要出現的最小成交天期 |
+| `SPIKE_L2_MIN_RATE` | 0.00035 | L2 觸發：recent-1m 最高成交利率 |
+| `SPIKE_L2_MIN_LONG_PERIOD` | 120 | L2 需要出現的最小成交天期 |
+| `SPIKE_L2_MIN_LONG_TRADES` | 2 | L2 需要的該天期成交筆數 |
+| `SPIKE_RECENT_WINDOW_SEC` | 60 | 「最近 1 分鐘」視窗 |
+| `SPIKE_BASELINE_WINDOW_SEC` | 86400 | 「過去 24h」基線視窗 |
+
+### Spike 配比
+| 變數 | 預設 | 格式 |
+|------|------|------|
+| `SPIKE_SPLIT_L1` | `0.40,0.20,0.40` | 2d, 30d, 120d |
+| `SPIKE_SPLIT_L2` | `0.10,0.20,0.70` | 2d, 30d, 120d |
+
+### 其他
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `FUND_CURRENCY` | fUSD | 幣種 |
+| `BITFINEX_MIN_FUNDING_ORDER_USD` | 150 | 交易所單筆最小下單 |
+| `MINIMUM_FUNDS` | 500 | 梯子每階 chunk 下限 |
+| `RATE_ADJUSTMENT_RATIO` | 1.11 | 2d/30d 梯子寬度 |
+
+---
+
+## 八、已捨棄的舊邏輯
+
+下列項目在新策略下已不使用（但相關函式仍保留在 `start.py`，未來需要可再用）：
+
+- **固定四桶配比**（`NORMAL_MARGIN_SPLIT` / `HIGH_RATE_MARGIN_SPLIT`）：被資金分層 + spike level 配比取代。
+- **高利率模式門檻**（`HIGH_RATE_APY_MIN`）：spike 判定改用近 1 分鐘 vs 24h 的動態結構，不再用單一 APY 門檻。
+- **`cancel_all_funding_offers`**：改用 `cancel_funding_offer(id)` 精準撤單，避免誤撤 preposition。
+- **歷史 K 線壓頂**（`FUNDING_HIST_*`）：preposition target rate 直接用近 N 天 hourly funding candle HIGH 的 p99，不再需要 K 線 slack。
+
+---
+
+**最後更新**：2026-04-21
