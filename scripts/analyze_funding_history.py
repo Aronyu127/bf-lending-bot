@@ -3,8 +3,8 @@
 Fetch Bitfinex public funding candles and summarize APY distributions.
 Uses aggregated hourly series trade:1h:{fUSD|fUST}:a30:p2:p30 (UI-style bucket).
 
-This is a market-rate proxy; the bot's HIGH_RATE_APY_MIN compares against a
-book-derived 2d ladder top, so calibrate thresholds with live logs if needed.
+This is a market-rate proxy for manual calibration; production bot sizing uses
+detect_spike_level + BASE/SPIKE splits from start.py env.
 """
 
 from __future__ import annotations

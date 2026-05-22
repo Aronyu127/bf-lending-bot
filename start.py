@@ -101,25 +101,38 @@ def _env_split(name: str, default: Tuple[float, ...], keys: Tuple[int, ...]) -> 
     return dict(zip(keys, parts))
 
 
-# Locked high-rate loan definition
-LOCKED_MIN_PERIOD_DAYS = _env_int("LOCKED_MIN_PERIOD_DAYS", 60)
-LOCKED_MIN_RATE = _env_float("LOCKED_MIN_RATE", 0.00040)
 
-# Base mode split (applied to available_capital when no spike)
+
 #   2d / 120d-preposition / reserve
-BASE_SPLIT_2D = _env_float("BASE_SPLIT_2D", 0.70)
-BASE_SPLIT_120D_PREPOSITION = _env_float("BASE_SPLIT_120D_PREPOSITION", 0.25)
+BASE_SPLIT_2D = _env_float("BASE_SPLIT_2D", 0.45)
+BASE_SPLIT_120D_PREPOSITION = _env_float("BASE_SPLIT_120D_PREPOSITION", 0.50)
 BASE_SPLIT_RESERVE = _env_float("BASE_SPLIT_RESERVE", 0.05)
 
-# Pre-positioning
-#   target_rate = clamp(p99_rate * 0.98, [floor, ceil])
+# Pre-positioning — touch-only (rolling-window hit frequency on hourly funding HIGHs).
+#   r* = largest r such that each sliding window of PREPOSITION_TOUCH_WINDOW_HOURS has
+#        average hourly count(high >= r) >= PREPOSITION_MIN_AVG_TOUCHES
+#   raw = r* * PREPOSITION_P99_MULT
+#   target = min(raw, PREPOSITION_RATE_CEIL) — no clamp-to-floor on success paths
+#   PREPOSITION_FALLBACK_RATE: insufficient candles, API empty, touch infeasible
 PREPOSITION_PERIOD = _env_int("PREPOSITION_PERIOD", 120)
-PREPOSITION_RATE_FLOOR = _env_float("PREPOSITION_RATE_FLOOR", 0.00040)
-PREPOSITION_RATE_CEIL = _env_float("PREPOSITION_RATE_CEIL", 0.00048)
+PREPOSITION_RATE_CEIL = _env_float("PREPOSITION_RATE_CEIL", 0.0050)
+PREPOSITION_FALLBACK_RATE = _env_float("PREPOSITION_FALLBACK_RATE", 0.0038)
 PREPOSITION_P99_MULT = _env_float("PREPOSITION_P99_MULT", 0.98)
-PREPOSITION_LOOKBACK_DAYS = _env_int("PREPOSITION_LOOKBACK_DAYS", 3)
+PREPOSITION_TOUCH_LOOKBACK_DAYS = _env_int("PREPOSITION_TOUCH_LOOKBACK_DAYS", 10)
+PREPOSITION_TOUCH_WINDOW_HOURS = _env_int("PREPOSITION_TOUCH_WINDOW_HOURS", 48)
+PREPOSITION_MIN_AVG_TOUCHES = _env_float("PREPOSITION_MIN_AVG_TOUCHES", 5.0)
 # Tolerance band around target_rate for keeping existing preposition offers in place.
 PREPOSITION_TOLERANCE = _env_float("PREPOSITION_TOLERANCE", 0.00002)
+PREPOSITION_REFRESH_HOURS = _env_int("PREPOSITION_REFRESH_HOURS", 24)
+_RAW_KEEP_MAX_PREPO = os.getenv("PREPOSITION_KEEP_MAX_RATE")
+try:
+    PREPOSITION_KEEP_MAX_RATE: Optional[float] = (
+        float(str(_RAW_KEEP_MAX_PREPO).strip())
+        if _RAW_KEEP_MAX_PREPO and str(_RAW_KEEP_MAX_PREPO).strip()
+        else None
+    )
+except ValueError:
+    PREPOSITION_KEEP_MAX_RATE = None
 
 # Spike detection
 SPIKE_L1_MULTIPLIER = _env_float("SPIKE_L1_MULTIPLIER", 1.8)  # last-1m avg / 24h avg
@@ -132,8 +145,8 @@ SPIKE_BASELINE_WINDOW_SEC = _env_int("SPIKE_BASELINE_WINDOW_SEC", 86400)
 
 # Spike splits (applied to available_capital when a spike is active)
 #   keys: 2d / 30d / 120d
-SPIKE_SPLIT_L1 = _env_split("SPIKE_SPLIT_L1", (0.40, 0.20, 0.40), (2, 30, 120))
-SPIKE_SPLIT_L2 = _env_split("SPIKE_SPLIT_L2", (0.10, 0.20, 0.70), (2, 30, 120))
+SPIKE_SPLIT_L1 = _env_split("SPIKE_SPLIT_L1", (0.40, 0.0, 0.60), (2, 30, 120))
+SPIKE_SPLIT_L2 = _env_split("SPIKE_SPLIT_L2", (0.10, 0.0, 0.90), (2, 30, 120))
 
 # Rate ladder shape (used for 2d/30d buckets that need multi-step laddering)
 #   rate_low  = max(market_floor, p{LADDER_LOW_PCT} of last-24h trades for that tenor)
@@ -143,7 +156,7 @@ LADDER_HIGH_PCT = _env_float("LADDER_HIGH_PCT", 95.0)
 LADDER_MIN_SAMPLES = _env_int("LADDER_MIN_SAMPLES", 20)
 _STEPS_MAX_BUCKET_SIZE = 1000.0
 
-# Preposition target rate minimum sample threshold (for p99 calc)
+# Preposition touch: minimum hourly candle count before computing rolling-window stats
 PREPOSITION_MIN_SAMPLES = _env_int("PREPOSITION_MIN_SAMPLES", 50)
 
 # Dry-run: log orders without hitting the exchange
@@ -173,17 +186,54 @@ def _validate_config() -> None:
     # Spike splits are hard-validated inside _env_split at import time (sum≈1,
     # each value in [0,1]), so no extra check here.
 
-    if PREPOSITION_RATE_FLOOR >= PREPOSITION_RATE_CEIL:
+    if PREPOSITION_RATE_CEIL <= 0:
+        errors.append(f"PREPOSITION_RATE_CEIL ({PREPOSITION_RATE_CEIL}) must be > 0")
+    if PREPOSITION_FALLBACK_RATE <= 0:
         errors.append(
-            f"PREPOSITION_RATE_FLOOR ({PREPOSITION_RATE_FLOOR}) must be < "
+            f"PREPOSITION_FALLBACK_RATE ({PREPOSITION_FALLBACK_RATE}) must be > 0"
+        )
+    if PREPOSITION_FALLBACK_RATE > PREPOSITION_RATE_CEIL:
+        errors.append(
+            f"PREPOSITION_FALLBACK_RATE ({PREPOSITION_FALLBACK_RATE}) must be <= "
             f"PREPOSITION_RATE_CEIL ({PREPOSITION_RATE_CEIL})"
         )
     if not (0 < PREPOSITION_P99_MULT <= 1.5):
         errors.append(f"PREPOSITION_P99_MULT ({PREPOSITION_P99_MULT}) must be in (0, 1.5]")
-    if LOCKED_MIN_PERIOD_DAYS < 1 or LOCKED_MIN_PERIOD_DAYS > 120:
-        errors.append(f"LOCKED_MIN_PERIOD_DAYS ({LOCKED_MIN_PERIOD_DAYS}) must be in [1, 120]")
-    if LOCKED_MIN_RATE <= 0:
-        errors.append(f"LOCKED_MIN_RATE ({LOCKED_MIN_RATE}) must be > 0")
+    if PREPOSITION_KEEP_MAX_RATE is not None and PREPOSITION_KEEP_MAX_RATE <= 0:
+        errors.append(
+            "PREPOSITION_KEEP_MAX_RATE must be > 0 when set (omit env var to disable)"
+        )
+    if PREPOSITION_TOUCH_WINDOW_HOURS < 2:
+        errors.append(
+            f"PREPOSITION_TOUCH_WINDOW_HOURS ({PREPOSITION_TOUCH_WINDOW_HOURS}) must be >= 2"
+        )
+    if PREPOSITION_TOUCH_WINDOW_HOURS > 24 * 30:
+        errors.append(
+            f"PREPOSITION_TOUCH_WINDOW_HOURS ({PREPOSITION_TOUCH_WINDOW_HOURS}) must be <= 720"
+        )
+    if PREPOSITION_MIN_AVG_TOUCHES <= 0:
+        errors.append(
+            f"PREPOSITION_MIN_AVG_TOUCHES ({PREPOSITION_MIN_AVG_TOUCHES}) must be > 0"
+        )
+    if PREPOSITION_MIN_AVG_TOUCHES > float(PREPOSITION_TOUCH_WINDOW_HOURS):
+        errors.append(
+            "PREPOSITION_MIN_AVG_TOUCHES must be <= PREPOSITION_TOUCH_WINDOW_HOURS "
+            f"({PREPOSITION_MIN_AVG_TOUCHES} > {PREPOSITION_TOUCH_WINDOW_HOURS})"
+        )
+    if PREPOSITION_MIN_SAMPLES < PREPOSITION_TOUCH_WINDOW_HOURS + 1:
+        errors.append(
+            "PREPOSITION_MIN_SAMPLES must be >= PREPOSITION_TOUCH_WINDOW_HOURS + 1 "
+            f"(got {PREPOSITION_MIN_SAMPLES} < {PREPOSITION_TOUCH_WINDOW_HOURS + 1})"
+        )
+    if PREPOSITION_TOUCH_LOOKBACK_DAYS < 1:
+        errors.append(
+            f"PREPOSITION_TOUCH_LOOKBACK_DAYS ({PREPOSITION_TOUCH_LOOKBACK_DAYS}) must be >= 1"
+        )
+    if PREPOSITION_REFRESH_HOURS < 0:
+        errors.append(
+            f"PREPOSITION_REFRESH_HOURS ({PREPOSITION_REFRESH_HOURS}) must be >= 0 "
+            "(0 disables age-based refresh)"
+        )
     if not (0 < LADDER_LOW_PCT < LADDER_HIGH_PCT <= 100):
         errors.append(
             f"LADDER_LOW_PCT ({LADDER_LOW_PCT}) must be < LADDER_HIGH_PCT "
@@ -212,10 +262,17 @@ def setup() -> None:
     """Validate config and build the Bitfinex client. Call from main guard."""
     global bfx
     _validate_config()
+    _pmax = PREPOSITION_KEEP_MAX_RATE
     log(
         f"Config OK: base_split=({BASE_SPLIT_2D},{BASE_SPLIT_120D_PREPOSITION},"
         f"{BASE_SPLIT_RESERVE}) spike_l1={SPIKE_SPLIT_L1} spike_l2={SPIKE_SPLIT_L2} "
-        f"preposition=[{PREPOSITION_RATE_FLOOR},{PREPOSITION_RATE_CEIL}] DRY_RUN={DRY_RUN}"
+        f"preposition_touch_lb={PREPOSITION_TOUCH_LOOKBACK_DAYS}d "
+        f"win={PREPOSITION_TOUCH_WINDOW_HOURS}h "
+        f"min_avg_hits={PREPOSITION_MIN_AVG_TOUCHES} "
+        f"ceil={PREPOSITION_RATE_CEIL} fallback={PREPOSITION_FALLBACK_RATE} "
+        f"prep_refresh_age_h={PREPOSITION_REFRESH_HOURS} "
+        f"keep_max_prepo={_pmax} "
+        f"DRY_RUN={DRY_RUN}"
     )
     bfx = Client(api_key=os.getenv("BF_API_KEY"), api_secret=os.getenv("BF_API_SECRET"))
 
@@ -400,8 +457,40 @@ def _percentile_sorted(values: List[float], pct: float) -> float:
     return xs[f] + (k - f) * (xs[c] - xs[f])
 
 
+def _preposition_avg_hourly_hits(highs: List[float], window_h: int, r: float) -> float:
+    """Mean over rolling windows: count hours with HIGH >= r (per-window count)."""
+    if len(highs) < window_h:
+        return 0.0
+    nwin = len(highs) - window_h + 1
+    tot = 0.0
+    for i in range(nwin):
+        chunk = highs[i : i + window_h]
+        tot += sum(1 for h in chunk if h >= r)
+    return tot / float(nwin)
+
+
+def _preposition_max_rate_for_touch_budget(
+    highs: List[float], window_h: int, min_avg_hits: float
+) -> Optional[float]:
+    """
+    Largest threshold r >= 0 such that avg rolling-window hourly hit-count >= min_avg_hits.
+
+    Hits = hours in each length-window_h slice where hourly HIGH >= r.
+    """
+    lo, hi = 0.0, max(highs)
+    if _preposition_avg_hourly_hits(highs, window_h, lo) + 1e-15 < min_avg_hits:
+        return None
+    for _ in range(56):
+        mid = (lo + hi) / 2.0
+        if _preposition_avg_hourly_hits(highs, window_h, mid) >= min_avg_hits:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 # =============================================================================
-# Pre-positioning target rate (p99 of hourly funding candle HIGHs)
+# Pre-positioning target rate (hourly funding candle highs)
 # =============================================================================
 
 _PREPOSITION_CANDLE_KEY = "trade:1h:{currency}:a30:p2:p30"
@@ -419,9 +508,10 @@ async def _fetch_funding_candles_high(currency: str, since_ms: int) -> List[floa
     Returns a list of HIGH rates (one per candle). Empty list on failure.
     """
     key = _PREPOSITION_CANDLE_KEY.format(currency=currency)
+    end_ms = int(time.time() * 1000)
     url = (
         f"{BITFINEX_PUBLIC_API_URL}/v2/candles/{key}/hist"
-        f"?start={since_ms}&limit=10000&sort=1"
+        f"?start={since_ms}&end={end_ms}&limit=10000&sort=1"
     )
     connector = aiohttp.TCPConnector(ssl=_AIOHTTP_SSL)
     try:
@@ -449,48 +539,70 @@ async def _fetch_funding_candles_high(currency: str, since_ms: int) -> List[floa
 
 async def compute_preposition_target_rate(currency: str) -> Tuple[float, str]:
     """
-    target_rate = clamp(p99_of_hourly_highs * PREPOSITION_P99_MULT, [floor, ceil])
+    Preposition LIMIT rate — touch-frequency method only:
 
-    Uses last PREPOSITION_LOOKBACK_DAYS of hourly funding candle HIGHs.
-    HIGH is the per-hour peak, which is exactly what we want to track for
-    the "preposition at high-rate zone" strategy, and the candle endpoint
-    never truncates for our window size.
+      r* = largest r such that rolling PREPOSITION_TOUCH_WINDOW_HOURS slices of hourly
+           HIGH satisfy average count(high >= r) >= PREPOSITION_MIN_AVG_TOUCHES
+      raw = r * PREPOSITION_P99_MULT
+      target = min(raw, PREPOSITION_RATE_CEIL)
 
-    Falls back to the floor when samples are insufficient or the API fails.
-    Returns (rate, source_label) for logging.
+    If candles are missing/infeasible, use PREPOSITION_FALLBACK_RATE (not used on success).
     """
     now_s = time.time()
-    since_s = now_s - PREPOSITION_LOOKBACK_DAYS * 86400
+    lookback_d = PREPOSITION_TOUCH_LOOKBACK_DAYS
+    since_s = now_s - lookback_d * 86400
     since_ms = int(since_s * 1000)
 
     def _fmt(ts: float) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
-    window_label = (
-        f"{_fmt(since_s)} ~ {_fmt(now_s)} "
-        f"({PREPOSITION_LOOKBACK_DAYS}d)"
-    )
+    window_label = f"{_fmt(since_s)} ~ {_fmt(now_s)} ({lookback_d}d)"
 
     highs = await _fetch_funding_candles_high(currency, since_ms)
 
     if len(highs) < PREPOSITION_MIN_SAMPLES:
-        target = PREPOSITION_RATE_FLOOR
+        tgt = PREPOSITION_FALLBACK_RATE
         log(
-            f"Preposition target: window={window_label}, insufficient candle samples "
-            f"({len(highs)} < {PREPOSITION_MIN_SAMPLES}), fallback to floor {target}"
+            f"Preposition touch: window={window_label}, insufficient candle samples "
+            f"({len(highs)} < {PREPOSITION_MIN_SAMPLES}), fallback_rate={tgt}"
         )
-        return target, "fallback_floor"
+        return tgt, "fallback_insufficient_samples"
 
-    p99 = _percentile_sorted(highs, 99.0)
-    raw = p99 * PREPOSITION_P99_MULT
-    target = min(max(PREPOSITION_RATE_FLOOR, raw), PREPOSITION_RATE_CEIL)
+    w = PREPOSITION_TOUCH_WINDOW_HOURS
+    k_need = PREPOSITION_MIN_AVG_TOUCHES
+    r_star = _preposition_max_rate_for_touch_budget(highs, w, k_need)
+    if r_star is None:
+        tgt = PREPOSITION_FALLBACK_RATE
+        log(
+            f"Preposition touch: window={window_label}, constraint infeasible "
+            f"(need avg>={k_need} hits/{w}h), fallback_rate={tgt}"
+        )
+        return tgt, "touch_infeasible_fallback"
+
+    raw = r_star * PREPOSITION_P99_MULT
+    if not (raw > 0) or math.isnan(raw):
+        tgt = PREPOSITION_FALLBACK_RATE
+        log(f"Preposition touch: invalid raw={raw}, fallback_rate={tgt}")
+        return tgt, "fallback_bad_raw"
+
+    target = min(raw, PREPOSITION_RATE_CEIL)
+
+    avg_at_raw = _preposition_avg_hourly_hits(highs, w, raw)
+    src = f"touch_{w}h_avg{avg_at_raw:.2f}hits_goal_{k_need:g}_candles_{len(highs)}"
+
+    if raw > PREPOSITION_RATE_CEIL * 1.0000001:
+        log(
+            f"WARNING: touch raw {raw:.8f} > PREPOSITION_RATE_CEIL {PREPOSITION_RATE_CEIL:.8f}; "
+            f"target clipped — raise CEIL if your candle scale needs a higher cap."
+        )
+
+    avg_c = _preposition_avg_hourly_hits(highs, w, target)
     log(
-        f"Preposition target: window={window_label}, "
-        f"p99_high={p99:.8f} * {PREPOSITION_P99_MULT} = {raw:.8f} "
-        f"-> clamp[{PREPOSITION_RATE_FLOOR}, {PREPOSITION_RATE_CEIL}] = {target:.8f} "
-        f"(hourly candles={len(highs)})"
+        f"Preposition touch: {window_label} raw={raw:.8f} -> target={target:.8f} "
+        f"avg_hits_per_{w}h@target={avg_c:.2f} (goal {PREPOSITION_MIN_AVG_TOUCHES:g}) "
+        f"src={src} candles={len(highs)}"
     )
-    return target, f"p99_high_candles_{len(highs)}"
+    return target, src
 
 
 # =============================================================================
@@ -615,42 +727,55 @@ async def get_available_balance(currency: str):
         return None
 
 
-def classify_loans(credits: List[FundingCredit]) -> Dict[str, List[FundingCredit]]:
-    """Split active credits into locked_high_rate vs active_other."""
-    locked: List[FundingCredit] = []
-    other: List[FundingCredit] = []
+def _active_credits_rollups(credits: List[FundingCredit]) -> Tuple[int, float]:
+    """Count and summed abs(amount) USD notionals — informational log only."""
+    tot = 0.0
     for c in credits or []:
         try:
-            period = int(c.period)
-            rate = float(c.rate)
+            tot += abs(float(c.amount))
         except (TypeError, ValueError, AttributeError):
-            other.append(c)
             continue
-        if period >= LOCKED_MIN_PERIOD_DAYS and rate >= LOCKED_MIN_RATE:
-            locked.append(c)
-        else:
-            other.append(c)
-    return {"locked": locked, "other": other}
+    return len(credits or []), tot
+
+
+def _funding_offer_created_ms(o: FundingOffer) -> Optional[int]:
+    """
+    Bitfinex v2 REST offer row exposes MTS_CREATED (ms epoch). Created time is used
+    so partial updates do not reset the resting-age clock.
+    """
+    for key in ("mts_created", "mts_create", "mtsCreated"):
+        v = getattr(o, key, None)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+            if n > 10_000_000_000:
+                return n
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def classify_offers(
     offers: List[FundingOffer],
     currency: str,
-    preposition_target_rate: float,
+    prep_target_rate: float,
 ) -> Dict[str, List[FundingOffer]]:
-    """Split pending offers into 'preposition' (keep) vs 'other' (may cancel).
+    """Bucket pending lending offers:
 
-    Keep rule (asymmetric):
-      period == PREPOSITION_PERIOD AND rate + PREPOSITION_TOLERANCE >= target_rate
+    kept_prep — 120d offers we KEEP on the book this round (meet target/tolerance).
 
-    An existing preposition offer priced *above* target_rate is preserved — it
-    can only earn us more if it fills during a spike, and cancelling it to re-list
-    at a lower rate would be self-sabotage. Only offers priced meaningfully
-    *below* target_rate are rotated out.
-    """
+    cancel_queue — everything else WE own on the book here: will be canceled and replaced
+      per the new ladder/spike/preposition plan when the loop runs submit (includes stale
+      120d flagged for PREPOSITION_REFRESH, bad rate bands, KEEP_MAX trims, wrong tenor).
+
+    Naming note: unrelated to borrowers; these are OUR resting offers."""
     cur = (currency or "").upper()
-    preposition: List[FundingOffer] = []
-    other: List[FundingOffer] = []
+    now_ms = int(time.time() * 1000)
+    kept_prep: List[FundingOffer] = []
+    cancel_queue: List[FundingOffer] = []
+    refresh_ms = PREPOSITION_REFRESH_HOURS * 3600 * 1000 if PREPOSITION_REFRESH_HOURS > 0 else 0
+
     for o in offers or []:
         sym = getattr(o, "symbol", "") or ""
         if str(sym).upper() != cur:
@@ -659,16 +784,33 @@ def classify_offers(
             period = int(o.period)
             rate = float(o.rate)
         except (TypeError, ValueError, AttributeError):
-            other.append(o)
+            cancel_queue.append(o)
             continue
         if (
             period == PREPOSITION_PERIOD
-            and rate + PREPOSITION_TOLERANCE >= preposition_target_rate
+            and PREPOSITION_KEEP_MAX_RATE is not None
+            and rate > PREPOSITION_KEEP_MAX_RATE
         ):
-            preposition.append(o)
+            cancel_queue.append(o)
+            continue
+
+        if period == PREPOSITION_PERIOD and refresh_ms > 0:
+            cms = _funding_offer_created_ms(o)
+            if cms is not None and now_ms - cms >= refresh_ms:
+                age_h = (now_ms - cms) / 3_600_000.0
+                cancel_queue.append(o)
+                log(
+                    "Preposition refresh: period=%sd rate=%s id=%s "
+                    "created_age_h=%.1f >= %dh -> reschedule"
+                    % (period, rate, getattr(o, "id", "?"), age_h, PREPOSITION_REFRESH_HOURS)
+                )
+                continue
+
+        if period == PREPOSITION_PERIOD and rate + PREPOSITION_TOLERANCE >= prep_target_rate:
+            kept_prep.append(o)
         else:
-            other.append(o)
-    return {"preposition": preposition, "other": other}
+            cancel_queue.append(o)
+    return {"kept_prep": kept_prep, "cancel_queue": cancel_queue}
 
 
 def _sum_offer_amounts(offers: List[FundingOffer]) -> float:
@@ -756,9 +898,9 @@ def _redistribute_sub_minimum_buckets(
     Empty list => even the combined total can't reach the minimum; caller must skip.
 
     Examples (min=150):
-      [("2d", 210), ("prep", 75)]        -> [("2d", 285)]      # prep swept up
-      [("2d", 140), ("prep", 50)]        -> [("prep", 190)]    # 2d also < min, both escalate
-      [("120d", 350), ("30d", 100), ("2d", 50)] -> [("120d", 500)]  # small slices into 120d
+      [("2d", 210), ("prep_topup", 75)]        -> [("2d", 285)]    # top-up merged into 2d
+      [("2d", 140), ("prep_topup", 50)]        -> [("prep_topup", 190)]
+      [("120d_prep_topup", 350), ("30d", 100), ("2d", 50)] -> [("120d_prep_topup", 500)]
     """
     min_order = BITFINEX_MIN_FUNDING_ORDER_USD
     items = [(name, float(amt)) for name, amt in buckets if amt > 0]
@@ -802,49 +944,49 @@ def _redistribute_sub_minimum_buckets(
 
 def build_base_orders(
     available_capital: float,
-    preposition_already_placed: float,
-    preposition_target_rate: float,
+    kept_prep_notional: float,
+    prep_target_rate: float,
     ladder_2d: Tuple[float, float],
 ) -> List[Tuple[float, float, int]]:
     """
-    Base mode: targets are computed against `available_capital` (NOT placed-inclusive),
-    so already-placed preposition does not swell the pool.
+    Base mode: percentages apply to split_budget_notional:
+      split_budget_notional = available_capital + kept_prep_notional
 
-      target_2d   = available_capital * BASE_SPLIT_2D
-      target_120d = available_capital * BASE_SPLIT_120D_PREPOSITION
-      reserve     = available_capital * BASE_SPLIT_RESERVE  (stays in wallet)
+      target_2d   = split_budget_notional * BASE_SPLIT_2D
+      target_120d = split_budget_notional * BASE_SPLIT_120D_PREPOSITION
 
-    Already-placed preposition is then deducted from target_120d to get the topup.
+    Subtract already-kept prep from the 120d target to get incremental prep_topup only.
 
+    Orders still cannot spend more than ``available_capital`` on NEW offers (clip 2d).
     Fallback priority when sub-minimum: 2d first (easiest to fill).
     """
-    target_2d = available_capital * BASE_SPLIT_2D
-    target_120d = available_capital * BASE_SPLIT_120D_PREPOSITION
-    preposition_topup = max(0.0, target_120d - preposition_already_placed)
+    split_budget_notional = max(0.0, available_capital + kept_prep_notional)
+    target_2d = split_budget_notional * BASE_SPLIT_2D
+    target_120d = split_budget_notional * BASE_SPLIT_120D_PREPOSITION
+    prep_topup = max(0.0, target_120d - kept_prep_notional)
 
-    # Never overspend available_capital (reserve is what's left).
-    if target_2d + preposition_topup > available_capital:
-        # Honor preposition topup first, clip 2d.
-        target_2d = max(0.0, available_capital - preposition_topup)
+    if target_2d + prep_topup > available_capital:
+        target_2d = max(0.0, available_capital - prep_topup)
 
     log(
         f"Base mode (pre-redistribute): available={available_capital:.2f} "
+        f"split_budget_notional={split_budget_notional:.2f} (incl_kept_prep={kept_prep_notional:.2f}) "
         f"target_2d={target_2d:.2f} target_120d={target_120d:.2f} "
-        f"already_placed={preposition_already_placed:.2f} topup={preposition_topup:.2f}"
+        f"kept_prep_notional={kept_prep_notional:.2f} prep_topup={prep_topup:.2f}"
     )
 
     merged = _redistribute_sub_minimum_buckets([
         ("2d", target_2d),
-        ("preposition_topup", preposition_topup),
+        ("prep_topup", prep_topup),
     ])
     merged_map = dict(merged)
 
     orders: List[Tuple[float, float, int]] = []
-    topup_final = merged_map.get("preposition_topup", 0.0)
+    topup_final = merged_map.get("prep_topup", 0.0)
     actual_2d_final = merged_map.get("2d", 0.0)
 
     if topup_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
-        orders.append((round(topup_final, 8), preposition_target_rate, PREPOSITION_PERIOD))
+        orders.append((round(topup_final, 8), prep_target_rate, PREPOSITION_PERIOD))
     if actual_2d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
         orders.extend(
             _ladder_orders(
@@ -860,32 +1002,31 @@ def build_base_orders(
 def build_spike_orders(
     available_capital: float,
     level: int,
-    preposition_already_placed: float,
-    preposition_target_rate: float,
+    kept_prep_notional: float,
+    prep_target_rate: float,
     ladder_2d: Tuple[float, float],
     ladder_30d: Tuple[float, float],
 ) -> List[Tuple[float, float, int]]:
     """
-    Spike mode: targets computed against `available_capital` by the level split.
+    Spike mode: SPIKE_SPLIT_* applies to split_budget_notional:
+      split_budget_notional = available_capital + kept_prep_notional
 
-      target_Xd = available_capital * SPIKE_SPLIT_L{level}[X]   for X in {2, 30, 120}
-      topup_120d = max(0, target_120d - preposition_already_placed)
+      target_Xd = split_budget_notional * SPIKE_SPLIT_L{level}[X]
+      prep_topup_120d = max(0, target_120d - kept_prep_notional)
 
-    If topup_120d < target_120d (preposition already covers some), the savings
-    stay as-is — we don't re-inflate 2d/30d. 2d/30d budgets are fresh shares of
-    available, capped so 2d+30d+topup_120d <= available.
-
+    Clip 2d/30d + top-ups so aggregate NEW offer notional <= available_capital.
     Fallback priority when sub-minimum: 120d > 30d > 2d (favor long tenor).
     """
     split = SPIKE_SPLIT_L1 if level == 1 else SPIKE_SPLIT_L2
 
-    target_2d = available_capital * split[2]
-    target_30d = available_capital * split[30]
-    target_120d = available_capital * split[120]
-    topup_120d = max(0.0, target_120d - preposition_already_placed)
+    split_budget_notional = max(0.0, available_capital + kept_prep_notional)
+    target_2d = split_budget_notional * split[2]
+    target_30d = split_budget_notional * split[30]
+    target_120d = split_budget_notional * split[120]
+    prep_topup_120d = max(0.0, target_120d - kept_prep_notional)
 
     # Cap 2d + 30d so we don't overcommit available_capital.
-    slot_for_short = max(0.0, available_capital - topup_120d)
+    slot_for_short = max(0.0, available_capital - prep_topup_120d)
     short_target_sum = target_2d + target_30d
     if short_target_sum > slot_for_short and short_target_sum > 0:
         shrink = slot_for_short / short_target_sum
@@ -894,25 +1035,26 @@ def build_spike_orders(
 
     log(
         f"Spike L{level} (pre-redistribute): available={available_capital:.2f} "
+        f"split_budget_notional={split_budget_notional:.2f} (incl_kept_prep={kept_prep_notional:.2f}) "
         f"split={split} target_2d={target_2d:.2f} target_30d={target_30d:.2f} "
-        f"target_120d={target_120d:.2f} topup_120d={topup_120d:.2f} "
-        f"preposition_placed={preposition_already_placed:.2f}"
+        f"target_120d={target_120d:.2f} prep_topup_120d={prep_topup_120d:.2f} "
+        f"kept_prep_notional={kept_prep_notional:.2f}"
     )
 
     merged = _redistribute_sub_minimum_buckets([
-        ("120d_topup", topup_120d),
+        ("120d_prep_topup", prep_topup_120d),
         ("30d", target_30d),
         ("2d", target_2d),
     ])
     merged_map = dict(merged)
 
     orders: List[Tuple[float, float, int]] = []
-    topup_120d_final = merged_map.get("120d_topup", 0.0)
+    topup_120d_final = merged_map.get("120d_prep_topup", 0.0)
     budget_30d_final = merged_map.get("30d", 0.0)
     budget_2d_final = merged_map.get("2d", 0.0)
 
     if topup_120d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
-        orders.append((round(topup_120d_final, 8), preposition_target_rate, PREPOSITION_PERIOD))
+        orders.append((round(topup_120d_final, 8), prep_target_rate, PREPOSITION_PERIOD))
     if budget_30d_final + 1e-9 >= BITFINEX_MIN_FUNDING_ORDER_USD:
         orders.extend(
             _ladder_orders(
@@ -994,17 +1136,16 @@ _PLAN_DIFF_ABS_TOLERANCE = 20.0    # 20 USD floor, so small absolute drift still
 
 
 def _plan_matches_existing(
-    existing_offers: List[FundingOffer],
+    cancel_queue_existing: List[FundingOffer],
     new_orders: List[Tuple[float, float, int]],
 ) -> bool:
     """
-    Return True if cancelling existing_offers to place new_orders would be a no-op:
+    True if replacing cancel_queue_existing with new_orders would be a no-op:
       - Same (period, rounded-rate) bucket set on both sides
       - Each bucket's total amount differs by <= max(5%, 20 USD)
 
-    Used to skip the cancel+resubmit dance when the market hasn't meaningfully
-    moved. Preposition offers are classified out before this check, so we're
-    only comparing the laddered / spike buckets.
+    Skips cancel+resubmit when the book already matches the plan.
+    kept_prep offers are never passed in here.
     """
     def _bucketize_offers(offers: List[FundingOffer]) -> Dict[Tuple[int, float], float]:
         out: Dict[Tuple[int, float], float] = {}
@@ -1026,7 +1167,7 @@ def _plan_matches_existing(
             out[key] = out.get(key, 0.0) + amount
         return out
 
-    existing = _bucketize_offers(existing_offers)
+    existing = _bucketize_offers(cancel_queue_existing)
     planned = _bucketize_plan(new_orders)
 
     if existing.keys() != planned.keys():
@@ -1091,59 +1232,47 @@ async def lending_bot_strategy():
         log("Skip: failed to fetch account state; leaving offers untouched.")
         return
 
-    # 2. Early skip: if no usable capital at all, bail BEFORE hitting candle / book APIs.
-    #    Rough upper bound on cancellable offers = everything that's NOT a PREPOSITION_PERIOD
-    #    tenor. This is a conservative lower-bound on available_capital (the real
-    #    classify_offers later may keep even fewer as preposition, so actual capital
-    #    can only be >= this). If even this is below min, no amount of recomputation
-    #    will help.
-    rough_cancellable = sum(
+    # 2. Early skip if even a generous upper-bound on fungible liquidity is below min,
+    #    before candles / trades / books. Funding offers lock balance out of wallet
+    #    available_balance, so wallet + Σ|our resting offers on this symbol| approximates
+    #    collateral we could theoretically free + spend (includes keep/offers we'd skip
+    #    cancelling in practice — over-estimate is OK here; underestimate caused false skips).
+    cur_upper = str(currency or "").upper()
+    rough_offer_sum = sum(
         abs(float(o.amount))
         for o in (offers or [])
-        if getattr(o, "period", None) != PREPOSITION_PERIOD
+        if (getattr(o, "symbol", "") or "").upper() == cur_upper
     )
-    rough_capital = wallet_avail + rough_cancellable
+    rough_capital = wallet_avail + rough_offer_sum
     if rough_capital + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
         log(
-            f"Skip (early): rough available_capital {rough_capital:.2f} "
-            f"(wallet={wallet_avail:.2f} + non-preposition offers={rough_cancellable:.2f}) "
+            f"Skip (early): rough fungible_ceiling={rough_capital:.2f} "
+            f"(wallet={wallet_avail:.2f} + offers_matching_symbol={rough_offer_sum:.2f}) "
             f"below minimum {BITFINEX_MIN_FUNDING_ORDER_USD}; leaving offers untouched."
         )
         return
 
-    classified_loans = classify_loans(credits)
-    locked = classified_loans["locked"]
-    active_other = classified_loans["other"]
-    locked_amount = sum(abs(float(c.amount)) for c in locked)
-    other_amount = sum(abs(float(c.amount)) for c in active_other)
-    log(
-        f"Loans: locked_high_rate={len(locked)} ({locked_amount:.2f}) "
-        f"active_other={len(active_other)} ({other_amount:.2f})"
-    )
-    for c in locked:
-        log(
-            f"  LOCKED id={c.id} period={c.period}d rate={c.rate:.6f} "
-            f"amount={abs(float(c.amount)):.2f}"
-        )
+    ac_n, ac_notional = _active_credits_rollups(credits)
+    log(f"Credits(active): n={ac_n} notional={ac_notional:.2f}")
 
-    # 3. Preposition target rate (hourly candle HIGHs, separate fetch — could be cached later).
-    preposition_target_rate, _src = await compute_preposition_target_rate(currency)
+    # 3. Prep target rate from hourly candle highs (env still names it PREPOSITION_*).
+    prep_target_rate, _src = await compute_preposition_target_rate(currency)
 
-    # 4. Classify pending offers — preposition stays in place, others may be cancelled.
-    classified_offers = classify_offers(offers, currency, preposition_target_rate)
-    preposition_offers = classified_offers["preposition"]
-    other_offers = classified_offers["other"]
-    preposition_amount = _sum_offer_amounts(preposition_offers)
-    other_offers_amount = _sum_offer_amounts(other_offers)
+    # 4. Split OUR resting offers: keep on book vs cancel+re-quote this round.
+    offer_buckets = classify_offers(offers, currency, prep_target_rate)
+    kept_prep_offers = offer_buckets["kept_prep"]
+    cancel_queue_offers = offer_buckets["cancel_queue"]
+    kept_prep_notional = _sum_offer_amounts(kept_prep_offers)
+    cancel_queue_notional = _sum_offer_amounts(cancel_queue_offers)
     log(
-        f"Offers: preposition(keep)={len(preposition_offers)} ({preposition_amount:.2f}) "
-        f"other(cancel-candidates)={len(other_offers)} ({other_offers_amount:.2f})"
+        f"Offers: kept_prep={len(kept_prep_offers)} ({kept_prep_notional:.2f}) "
+        f"cancel_queue={len(cancel_queue_offers)} ({cancel_queue_notional:.2f})"
     )
 
-    # 5. available_capital = wallet + offers we're about to cancel.
-    available_capital = wallet_avail + other_offers_amount
+    # 5. available_capital = wallet + resting offers slated for cancellation (capital we free this round).
+    available_capital = wallet_avail + cancel_queue_notional
     log(
-        f"Capital: wallet={wallet_avail:.2f} cancellable_offers={other_offers_amount:.2f} "
+        f"Capital: wallet={wallet_avail:.2f} cancel_queue_resting={cancel_queue_notional:.2f} "
         f"-> available_capital={available_capital:.2f}"
     )
     if available_capital + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
@@ -1176,38 +1305,37 @@ async def lending_bot_strategy():
     if spike_level == 0:
         new_orders = build_base_orders(
             available_capital=available_capital,
-            preposition_already_placed=preposition_amount,
-            preposition_target_rate=preposition_target_rate,
+            kept_prep_notional=kept_prep_notional,
+            prep_target_rate=prep_target_rate,
             ladder_2d=ladder_2d,
         )
     else:
         new_orders = build_spike_orders(
             available_capital=available_capital,
             level=spike_level,
-            preposition_already_placed=preposition_amount,
-            preposition_target_rate=preposition_target_rate,
+            kept_prep_notional=kept_prep_notional,
+            prep_target_rate=prep_target_rate,
             ladder_2d=ladder_2d,
             ladder_30d=ladder_30d,
         )
 
     if not new_orders:
-        log("No new orders to place this round; keeping existing preposition offers.")
+        log("No new orders this round; kept_prep resting offers untouched.")
         return
 
-    # 10. No-op check: if current other_offers already match the plan closely,
-    #     skip cancel+resubmit to avoid losing queue priority every minute.
-    if _plan_matches_existing(other_offers, new_orders):
+    # 10. No-op: skip if cancel-queue offers already match the planned ladder/spike buckets.
+    if _plan_matches_existing(cancel_queue_offers, new_orders):
         log(
-            f"Skip: existing {len(other_offers)} offers already match the plan "
+            f"Skip: existing cancel_queue ({len(cancel_queue_offers)} offers) matches plan "
             f"(within {int(_PLAN_DIFF_REL_TOLERANCE * 100)}% / {_PLAN_DIFF_ABS_TOLERANCE} USD). "
             f"No cancel/resubmit."
         )
         return
 
-    # 11. Cancel non-preposition offers (preposition is never touched here).
-    cancel_attempts = len(other_offers)
+    # 11. Cancel every resting offer in the cancel_queue (wrong tenor, stale 120d, bad rate bands, …).
+    cancel_attempts = len(cancel_queue_offers)
     cancel_successes = 0
-    for o in other_offers:
+    for o in cancel_queue_offers:
         if await _cancel_offer(o):
             cancel_successes += 1
         await asyncio.sleep(0.1)

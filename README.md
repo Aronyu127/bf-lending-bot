@@ -37,6 +37,17 @@ Add BF_API_KEY and BF_API_SECRET in the environment setup section
 python 3.10
 run the pip install -r requirements.txt 
 
+## Tests
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q tests/
+```
+
+`tests/` covers pure helpers (`_active_credits_rollups`, preposition touch math, spike rules) **without calling Bitfinex**.
+
 ## Disclaimer
 
 This bot is for educational purposes only. Use at your own risk. Cryptocurrency lending carries inherent risks, and past performance does not guarantee future results.
