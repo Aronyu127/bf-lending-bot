@@ -224,6 +224,23 @@ def _mts_to_local(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).astimezone()
 
 
+def _fmt_local_ms(ms: int) -> str:
+    if not ms or ms <= 0:
+        return "—"
+    return _mts_to_local(int(ms)).strftime("%Y-%m-%d %H:%M")
+
+
+def _credit_started_ms(c) -> int:
+    ms = int(getattr(c, "mts_opening", None) or 0)
+    if ms > 0:
+        return ms
+    return int(getattr(c, "mts_create", None) or 0)
+
+
+def _offer_created_ms(o) -> int:
+    return int(getattr(o, "mts_create", None) or 0)
+
+
 def _credit_expiry_ms(c) -> int:
     return int(c.mts_opening + c.period * _MS_DAY)
 
@@ -276,6 +293,7 @@ def _build_credits_df(credits):
             {
                 "幣種": sym,
                 "金額": round(abs(c.amount), 4),
+                "建立時間": _fmt_local_ms(_credit_started_ms(c)),
                 "天數": int(c.period),
                 "年化率 %": _rate_to_apy_pct(c.rate),
                 "期限": _credit_time_left(c),
@@ -295,6 +313,7 @@ def _build_offers_df(offers):
             {
                 "幣種": sym,
                 "金額": round(abs(o.amount), 4),
+                "建立時間": _fmt_local_ms(_offer_created_ms(o)),
                 "天數": int(o.period),
                 "年化率 %": _rate_to_apy_pct(o.rate),
                 "狀態": o.offer_status,
@@ -391,6 +410,11 @@ def _df_credit_config():
     return {
         "幣種": st.column_config.TextColumn("幣種", width="small"),
         "金額": st.column_config.NumberColumn("金額", format="%.4f", help="該筆融資部位"),
+        "建立時間": st.column_config.TextColumn(
+            "建立時間",
+            width="medium",
+            help="本筆開始計息時間（mts_opening；無則 mts_create）· 本地時區",
+        ),
         "天數": st.column_config.NumberColumn("天數", format="%d", width="small"),
         "年化率 %": st.column_config.NumberColumn("年化率 %", format="%.2f", width="small"),
         "期限": st.column_config.TextColumn("期限", width="medium"),
@@ -402,6 +426,11 @@ def _df_offer_config():
     return {
         "幣種": st.column_config.TextColumn("幣種", width="small"),
         "金額": st.column_config.NumberColumn("金額", format="%.4f"),
+        "建立時間": st.column_config.TextColumn(
+            "建立時間",
+            width="medium",
+            help="REST mts_create · 本地時區",
+        ),
         "天數": st.column_config.NumberColumn("天數", format="%d", width="small"),
         "年化率 %": st.column_config.NumberColumn("年化率 %", format="%.2f", width="small"),
         "狀態": st.column_config.TextColumn("狀態", width="medium"),
