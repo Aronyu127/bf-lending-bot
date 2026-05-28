@@ -117,8 +117,8 @@ target  = min(raw, PREPOSITION_RATE_CEIL)
 
 成功路徑**不再**對 `target` 施加「下限 clamp」；只靠 touch 算出 `raw`，再用 **`CEIL` 做上沿**。
 
-- **`PREPOSITION_FALLBACK_RATE`**：僅在 **資料不足、candle API 異常 touch 約束無解、或算出無效 raw** 時用作本輪目標利率（並須 `≤ PREPOSITION_RATE_CEIL`）。
-- **`PREPOSITION_RATE_CEIL`**：若 `raw` 超過，`target` 被壓到 ceil，日誌會 WARNING。
+- **`PREPOSITION_FALLBACK_RATE`**：僅在 **資料不足、candle API 異常 touch 約束無解、或算出無效 raw** 時用作本輪目標利率（並須 `≤ PREPOSITION_RATE_CEIL`）；預設偏低，避免算不出 touch 時掛離譜高利。
+- **`PREPOSITION_RATE_CEIL`**：僅在 **touch 成功** 時限制 `raw`；預設偏高，讓市場尖峰算出來的 `raw` 多半能原樣掛出；若 `raw` 仍超過 ceil 才壓頂並 WARNING。
 - **`PREPOSITION_KEEP_MAX_RATE`**：仍可用於裁掉 **利率過高** 的預掛（見下文）。
 
 資料不足／touch 約束無解／無效結果 → **`PREPOSITION_FALLBACK_RATE`**。
@@ -220,8 +220,8 @@ Spike **只改**本輪 `build_*_orders` 的 **2d／30d／120d 配比**；**不�
 | 變數 | 預設 | 用途 |
 |------|------|------|
 | `PREPOSITION_PERIOD` | 120 | 預掛天期 |
-| `PREPOSITION_RATE_CEIL` | 0.0050 | touch 算出 `raw` 的上限 |
-| `PREPOSITION_FALLBACK_RATE` | 0.0038 | 僅異常／資料不足／touch 無解時（須 ≤ CEIL） |
+| `PREPOSITION_RATE_CEIL` | 0.0050 | touch 成功時 `raw` 上限（偏高，方便吃到尖峰；約 182% 簡單年化才會碰到） |
+| `PREPOSITION_FALLBACK_RATE` | 0.00040 | touch 失敗時專用（偏低、約 15% 簡單年化；與 CEIL 無關，不會自動變高） |
 | `PREPOSITION_P99_MULT` | 0.98 | raw 對 r* 的乘數 |
 | `PREPOSITION_TOUCH_LOOKBACK_DAYS` | 10 | hourly candle 回看天數 |
 | `PREPOSITION_TOUCH_WINDOW_HOURS` | 48 | 滑動窗長（小時） |
