@@ -283,6 +283,15 @@ def _ledger_is_funding_income(desc: str) -> bool:
     )
 
 
+def _offer_sum_for_currency(offers, currency: str) -> float:
+    sym = f"f{currency}".upper()
+    return sum(
+        abs(float(o.amount))
+        for o in (offers or [])
+        if (getattr(o, "symbol", "") or "").upper() == sym
+    )
+
+
 def _build_credits_df(credits):
     if not credits:
         return pd.DataFrame()
@@ -298,9 +307,11 @@ def _build_credits_df(credits):
                 "年化率 %": _rate_to_apy_pct(c.rate),
                 "期限": _credit_time_left(c),
                 "ID": int(c.id),
+                "_expiry_ms": _credit_expiry_ms(c),
             }
         )
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values("_expiry_ms", ascending=True, kind="mergesort")
+    return df.drop(columns=["_expiry_ms"]).reset_index(drop=True)
 
 
 def _build_offers_df(offers):
@@ -623,18 +634,27 @@ def main():
                 emap = {cur: ledgers_map[cur]}
                 earn30 = _sum_30d_earnings(emap)
             label = "USD" if cur == "USD" else "USDt"
+            avail = float(w.available_balance)
+            offer_sum = _offer_sum_for_currency(offers, cur)
+            idle = avail + offer_sum
             with st.container(border=True):
                 st.markdown(
                     f'<div class="asset-label"><span class="asset-dot"></span>{label}</div>',
                     unsafe_allow_html=True,
                 )
                 _render_fuly_metric_row(
-                    ["總餘額", "可用", "近 30 天收益（估算）", "加權年化 %"],
+                    ["總餘額", "閒置", "近 30 天收益（估算）", "加權年化 %"],
                     [
                         f"{w.balance:,.4f}",
-                        f"{w.available_balance:,.4f}",
+                        f"{idle:,.4f}",
                         f"{earn30 if earn30 is not None else 0:,.4f}",
                         f"{apy:.2f}%" if apy is not None else "—",
+                    ],
+                    captions=[
+                        "",
+                        f"可用 {avail:,.4f} · 掛單 {offer_sum:,.4f}",
+                        "",
+                        "",
                     ],
                 )
 
