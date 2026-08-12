@@ -417,6 +417,48 @@ def _sum_30d_earnings(ledgers_map) -> float:
     return round(s, 6)
 
 
+def _sum_currency_earnings(ledgers_map, currency: str, days_back: int) -> float:
+    ledgers = ledgers_map.get(currency) or []
+    cutoff_ms = int(
+        (datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000
+    )
+    s = 0.0
+    for L in ledgers:
+        if L.mts < cutoff_ms or L.amount <= 0:
+            continue
+        if _ledger_is_funding_income(L.description):
+            s += float(L.amount)
+    return s
+
+
+def _period_annualized_pct(earn: float, balance: float, days: int) -> Optional[float]:
+    start = balance - earn
+    if days <= 0 or start <= 0:
+        return None
+    return round(earn / start * 365.0 / days * 100.0, 2)
+
+
+def _render_period_apy_side(by_cur, ledgers_map, days: int) -> None:
+    cols = st.columns(2)
+    for col, cur, label in ((cols[0], "USD", "USD"), (cols[1], "UST", "USDt")):
+        with col:
+            w = by_cur.get(cur)
+            if not w:
+                st.markdown(f"**{label} 累積年化** —")
+                st.caption("無 funding 錢包")
+                continue
+            earn = _sum_currency_earnings(ledgers_map, cur, days)
+            bal = float(w.balance)
+            start = bal - earn
+            apy = _period_annualized_pct(earn, bal, days)
+            if apy is None:
+                st.markdown(f"**{label} 累積年化** —")
+                st.caption(f"利息 {earn:,.4f} · 期初 {start:,.4f}")
+            else:
+                st.markdown(f"**{label} 累積年化** {apy:.2f}%")
+                st.caption(f"利息 {earn:,.4f} · 期初 {start:,.4f}")
+
+
 def _df_credit_config():
     return {
         "幣種": st.column_config.TextColumn("幣種", width="small"),
@@ -673,7 +715,7 @@ def main():
                 )
 
         with tab_b:
-            c_sl_m, _ = st.columns([1, 3])
+            c_sl_m, c_apy_m = st.columns([1.1, 2.2])
             with c_sl_m:
                 days_m = st.slider(
                     "統計區間（天數）",
@@ -683,8 +725,12 @@ def main():
                     key="monthly_earn_days",
                     help="僅統計此天數內分錄，再依日曆月加總",
                 )
+            with c_apy_m:
+                st.markdown("")
+                _render_period_apy_side(by_cur, ledgers_map, days_m)
             st.caption(
                 "依日曆月加總；僅含已辨識的融資利息分錄。單次 API 最多約 500 筆 ledger，久遠月份可能不完整。"
+                " 累積年化＝區間利息÷期初本金×(365÷滑桿天數)；期初＝現餘額−區間利息（假設無進出金）。"
             )
             mdf = _build_monthly_earnings_summary(ledgers_map, days_back=days_m)
             if mdf.empty:
@@ -698,9 +744,23 @@ def main():
                 )
 
         with tab_c:
-            c_sl, _ = st.columns([1, 3])
+            c_sl, c_apy = st.columns([1.1, 2.2])
             with c_sl:
-                days = st.slider("天數", 7, 365, 90, help="篩選最近幾天內的收益分錄")
+                days = st.slider(
+                    "統計區間（天數）",
+                    7,
+                    365,
+                    90,
+                    key="daily_earn_days",
+                    help="篩選最近幾天內的收益分錄",
+                )
+            with c_apy:
+                st.markdown("")
+                _render_period_apy_side(by_cur, ledgers_map, days)
+            st.caption(
+                "僅含已辨識的融資利息分錄。單次 API 最多約 500 筆 ledger，久遠日期可能不完整。"
+                " 累積年化＝區間利息÷期初本金×(365÷滑桿天數)；期初＝現餘額−區間利息（假設無進出金）。"
+            )
             edf = _build_earnings_df(ledgers_map, days_back=days)
             if edf.empty:
                 st.info("此期間內沒有符合條件的收益分錄（或 API 未回傳 ledger）。")
