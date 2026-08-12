@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hmac
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -10,25 +8,26 @@ import streamlit as st
 from dotenv import load_dotenv
 from bfxapi import Client
 
+import tenants
+
 load_dotenv()
 
 _MS_DAY = 86400_000
-_DASH_AUTH_KEY = "_dash_auth_ok"
+_DASH_TENANT_KEY = "_dash_tenant"
 
 
-def _dashboard_password() -> Optional[str]:
-    raw = os.getenv("DASHBOARD_PASSWORD")
-    if raw is None or not str(raw).strip():
-        return None
-    return str(raw)
+def _require_dashboard_auth() -> str:
+    """Return the signed-in tenant name, or render the login form and stop."""
+    try:
+        known = {t.name for t in tenants.load_tenants()}
+    except tenants.TenantConfigError as e:
+        st.error(f"租戶環境變數設定有誤：{e}")
+        st.stop()
 
-
-def _require_dashboard_auth() -> None:
-    expected = _dashboard_password()
-    if expected is None:
-        return
-    if st.session_state.get(_DASH_AUTH_KEY):
-        return
+    current = st.session_state.get(_DASH_TENANT_KEY)
+    if current in known:
+        return current
+    st.session_state.pop(_DASH_TENANT_KEY, None)
 
     st.markdown(
         '<p class="dashboard-title">Bitfinex 融資儀表板</p>',
@@ -42,15 +41,9 @@ def _require_dashboard_auth() -> None:
         entered = st.text_input("密碼", type="password", autocomplete="current-password")
         submitted = st.form_submit_button("登入", width="stretch")
         if submitted:
-            try:
-                ok = hmac.compare_digest(
-                    entered.encode("utf-8"),
-                    expected.encode("utf-8"),
-                )
-            except Exception:
-                ok = False
-            if ok:
-                st.session_state[_DASH_AUTH_KEY] = True
+            matched = tenants.find_tenant_by_password(entered)
+            if matched is not None:
+                st.session_state[_DASH_TENANT_KEY] = matched.name
                 st.rerun()
             st.error("密碼錯誤")
     st.stop()
@@ -190,11 +183,12 @@ def _inject_css() -> None:
 
 
 @st.cache_data(ttl=45)
-def _snapshot():
-    key, sec = os.getenv("BF_API_KEY"), os.getenv("BF_API_SECRET")
-    if not key or not str(key).strip() or not sec or not str(sec).strip():
+def _snapshot(tenant_name: str):
+    # Keyed by tenant name only — credentials must never enter the cache key.
+    tenant = tenants.get_tenant(tenant_name)
+    if tenant is None:
         return None
-    bfx = Client(api_key=key, api_secret=sec)
+    bfx = Client(api_key=tenant.api_key, api_secret=tenant.api_secret)
     wallets = bfx.rest.auth.get_wallets()
     credits = bfx.rest.auth.get_funding_credits()
     offers = bfx.rest.auth.get_funding_offers()
@@ -624,13 +618,14 @@ def main():
         initial_sidebar_state="collapsed",
     )
     _inject_css()
-    _require_dashboard_auth()
+    tenant_name = _require_dashboard_auth()
 
     h1, h2, h3 = st.columns([3, 1, 1], vertical_alignment="center")
     with h1:
         st.markdown('<p class="dashboard-title">Bitfinex 融資儀表板</p>', unsafe_allow_html=True)
         st.markdown(
-            '<p class="dashboard-sub">資料約 45 秒快取一次 · 與交易所同步可能有延遲</p>',
+            '<p class="dashboard-sub">帳號 <span style="color:var(--fuly-gold);font-weight:700;">'
+            f"{tenant_name}</span> · 資料約 45 秒快取一次 · 與交易所同步可能有延遲</p>",
             unsafe_allow_html=True,
         )
     with h2:
@@ -641,19 +636,19 @@ def main():
             st.rerun()
     with h3:
         st.markdown("")
-        if _dashboard_password() is not None and st.button("登出", width="stretch"):
-            st.session_state.pop(_DASH_AUTH_KEY, None)
+        if st.button("登出", width="stretch"):
+            st.session_state.pop(_DASH_TENANT_KEY, None)
             st.rerun()
 
     try:
-        data = _snapshot()
+        data = _snapshot(tenant_name)
     except Exception as e:
         st.error(f"無法連線或讀取帳戶：{e}")
         data = None
 
     if data is None:
         st.warning(
-            "請在 `.env` 設定 `BF_API_KEY` 與 `BF_API_SECRET` 以查看帳戶與借貸明細；"
+            f"無法讀取帳號 `{tenant_name}` 的帳戶資料，請確認該租戶的 API 金鑰設定；"
             "頁面最下方仍可查看公開市場現況。"
         )
 

@@ -30,7 +30,26 @@ deploy on railway or any other app platform supports docker
 
 ## Configuration
 
-Add BF_API_KEY and BF_API_SECRET in the environment setup section
+Accounts are configured per tenant. List them in `TENANTS`, then add one block of
+variables per tenant (the tenant name is uppercased inside the variable names and
+must match `[A-Za-z0-9_]+`):
+
+```
+TENANTS=aron,bob
+
+TENANT_ARON_BF_API_KEY=...
+TENANT_ARON_BF_API_SECRET=...
+TENANT_ARON_PASSWORD=...          # dashboard login, must be unique per tenant
+TENANT_ARON_FUND_CURRENCY=fUSD    # optional, defaults to fUSD
+TENANT_ARON_DRY_RUN=0             # optional, 1 logs orders without placing them
+```
+
+The bot runs every tenant once per minute, staggered and isolated so one failure
+does not affect the others. The dashboard resolves the signed-in tenant from the
+password alone, which is why passwords must be unique.
+
+Strategy parameters (`BASE_SPLIT_*`, `PREPOSITION_*`, `SPIKE_*`, …) stay global and
+are shared by all tenants.
 
 ## Requirements
 

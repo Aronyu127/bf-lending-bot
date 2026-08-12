@@ -5,12 +5,15 @@ from dotenv import load_dotenv
 load_dotenv()
 import schedule
 import asyncio
-from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Dict, Tuple, Optional
 from bfxapi import Client
 from bfxapi.types import Wallet, FundingCredit, FundingOffer
 import ssl
 import certifi
 import aiohttp
+
+from tenants import Tenant, load_tenants
 
 _AIOHTTP_SSL = ssl.create_default_context(cafile=certifi.where())
 
@@ -41,7 +44,6 @@ log = logging.info
 # =============================================================================
 
 BITFINEX_PUBLIC_API_URL = "https://api-pub.bitfinex.com"
-DEFAULT_FUND_CURRENCY = "fUSD"
 
 _DEFAULT_MIN_FUNDS = 500.0
 _MF_RAW = os.getenv("MINIMUM_FUNDS")
@@ -160,9 +162,6 @@ _STEPS_MAX_BUCKET_SIZE = 1000.0
 # Preposition touch: minimum hourly candle count before computing rolling-window stats
 PREPOSITION_MIN_SAMPLES = _env_int("PREPOSITION_MIN_SAMPLES", 50)
 
-# Dry-run: log orders without hitting the exchange
-DRY_RUN = str(os.getenv("DRY_RUN", "")).strip().lower() in ("1", "true", "yes", "on")
-
 
 def _validate_config() -> None:
     """Hard-validate config at startup. Raise ValueError on any misconfiguration
@@ -253,15 +252,34 @@ def _validate_config() -> None:
 
 
 # =============================================================================
-# Client (lazy — initialised by setup() so `import start` stays side-effect-free)
+# Per-tenant run context (built by setup()/scheduler so `import start` stays
+# side-effect-free)
 # =============================================================================
 
-bfx: Optional[Client] = None
+@dataclass(frozen=True)
+class TenantRunCtx:
+    """Everything one strategy round needs that differs between tenants."""
+
+    name: str
+    client: Client
+    currency: str
+    dry_run: bool
+    log: Callable[[str], None]
 
 
-def setup() -> None:
-    """Validate config and build the Bitfinex client. Call from main guard."""
-    global bfx
+def build_ctx(tenant: Tenant) -> TenantRunCtx:
+    prefix = f"[{tenant.name}] "
+    return TenantRunCtx(
+        name=tenant.name,
+        client=Client(api_key=tenant.api_key, api_secret=tenant.api_secret),
+        currency=tenant.fund_currency,
+        dry_run=tenant.dry_run,
+        log=lambda msg: log(f"{prefix}{msg}"),
+    )
+
+
+def setup() -> List[Tenant]:
+    """Validate strategy config and tenant env, returning the tenant list."""
     _validate_config()
     _pmax = PREPOSITION_KEEP_MAX_RATE
     log(
@@ -272,20 +290,16 @@ def setup() -> None:
         f"min_avg_hits={PREPOSITION_MIN_AVG_TOUCHES} "
         f"ceil={PREPOSITION_RATE_CEIL} fallback={PREPOSITION_FALLBACK_RATE} "
         f"prep_refresh_age_h={PREPOSITION_REFRESH_HOURS} "
-        f"keep_max_prepo={_pmax} "
-        f"DRY_RUN={DRY_RUN}"
+        f"keep_max_prepo={_pmax}"
     )
-    bfx = Client(api_key=os.getenv("BF_API_KEY"), api_secret=os.getenv("BF_API_SECRET"))
-
-
-def _resolve_fund_currency() -> str:
-    raw = os.getenv("FUND_CURRENCY")
-    if raw is None or not str(raw).strip():
-        return DEFAULT_FUND_CURRENCY
-    s = str(raw).strip().upper()
-    if s.startswith("F") and len(s) > 1:
-        return "f" + s[1:]
-    return "f" + s
+    tenants = load_tenants()
+    log(
+        "Tenants: "
+        + ", ".join(
+            f"{t.name}({t.fund_currency}{', DRY_RUN' if t.dry_run else ''})" for t in tenants
+        )
+    )
+    return tenants
 
 
 # =============================================================================
@@ -694,33 +708,40 @@ def detect_spike_level(trades: list, now_ms: int) -> Tuple[int, dict]:
 # Account state
 # =============================================================================
 
-async def get_active_credits(currency: str):
+async def get_active_credits(ctx: TenantRunCtx):
     """FundingCredit = our funds currently matched and actively earning.
     Returns None on API failure (caller should skip the round)."""
+    log = ctx.log
     try:
-        return await asyncio.to_thread(bfx.rest.auth.get_funding_credits, symbol=currency)
+        return await asyncio.to_thread(
+            ctx.client.rest.auth.get_funding_credits, symbol=ctx.currency
+        )
     except Exception as e:
         log(f"Error getting funding credits: {e}")
         return None
 
 
-async def list_lending_offers(currency: str):
+async def list_lending_offers(ctx: TenantRunCtx):
     """Returns None on API failure (caller should skip the round)."""
+    log = ctx.log
     try:
-        return await asyncio.to_thread(bfx.rest.auth.get_funding_offers, symbol=currency)
+        return await asyncio.to_thread(
+            ctx.client.rest.auth.get_funding_offers, symbol=ctx.currency
+        )
     except Exception as e:
         log(f"Error getting lending offers: {e}")
         return None
 
 
-async def get_available_balance(currency: str):
+async def get_available_balance(ctx: TenantRunCtx):
     """funding wallet available_balance. Returns None on API failure."""
+    log = ctx.log
     try:
-        wallets: List[Wallet] = await asyncio.to_thread(bfx.rest.auth.get_wallets)
+        wallets: List[Wallet] = await asyncio.to_thread(ctx.client.rest.auth.get_wallets)
         for wallet in wallets:
             if str(wallet.wallet_type).lower() != "funding":
                 continue
-            if f"f{wallet.currency}" == currency:
+            if f"f{wallet.currency}" == ctx.currency:
                 return float(wallet.available_balance)
         return 0.0
     except Exception as e:
@@ -1081,23 +1102,26 @@ def build_spike_orders(
 # Order submission
 # =============================================================================
 
-async def _submit_offer(currency: str, amount: float, rate: float, period: int) -> bool:
+async def _submit_offer(
+    ctx: TenantRunCtx, amount: float, rate: float, period: int
+) -> bool:
     """Returns True on success, False on failure/skip."""
+    log = ctx.log
     if amount + 1e-9 < BITFINEX_MIN_FUNDING_ORDER_USD:
         log(f"Skip offer amount {amount}: below minimum {BITFINEX_MIN_FUNDING_ORDER_USD}")
         return False
     amount_str = f"{amount:.8f}"
     log(
-        f"{'[DRY_RUN] ' if DRY_RUN else ''}"
+        f"{'[DRY_RUN] ' if ctx.dry_run else ''}"
         f"Submit: period={period}d rate={rate:.6f} (~{rate * 365 * 100:.2f}% APY) "
         f"amount={amount_str}"
     )
-    if DRY_RUN:
+    if ctx.dry_run:
         return True
     try:
         await asyncio.to_thread(
-            bfx.rest.auth.submit_funding_offer,
-            type="LIMIT", symbol=currency, amount=amount_str, rate=rate, period=period,
+            ctx.client.rest.auth.submit_funding_offer,
+            type="LIMIT", symbol=ctx.currency, amount=amount_str, rate=rate, period=period,
         )
         return True
     except Exception as e:
@@ -1105,21 +1129,22 @@ async def _submit_offer(currency: str, amount: float, rate: float, period: int) 
         return False
 
 
-async def _cancel_offer(offer: FundingOffer) -> bool:
+async def _cancel_offer(ctx: TenantRunCtx, offer: FundingOffer) -> bool:
     """Returns True on success, False on failure."""
+    log = ctx.log
     try:
         oid = int(offer.id)
     except (TypeError, ValueError, AttributeError):
         return False
     log(
-        f"{'[DRY_RUN] ' if DRY_RUN else ''}"
+        f"{'[DRY_RUN] ' if ctx.dry_run else ''}"
         f"Cancel offer id={oid} period={offer.period}d rate={offer.rate} "
         f"amount={offer.amount}"
     )
-    if DRY_RUN:
+    if ctx.dry_run:
         return True
     try:
-        await asyncio.to_thread(bfx.rest.auth.cancel_funding_offer, id=oid)
+        await asyncio.to_thread(ctx.client.rest.auth.cancel_funding_offer, id=oid)
         return True
     except Exception as e:
         log(f"Error cancelling offer {oid}: {e}")
@@ -1129,6 +1154,9 @@ async def _cancel_offer(offer: FundingOffer) -> bool:
 # =============================================================================
 # Main strategy loop
 # =============================================================================
+
+# Delay between tenants within one scheduled round.
+_TENANT_STAGGER_SEC = 3.0
 
 # Tolerances used by _plan_matches_existing.
 _PLAN_DIFF_RATE_DECIMALS = 5       # round rate to this many decimals when bucketing
@@ -1219,16 +1247,17 @@ def _scale_orders_to_cap(
     return scaled
 
 
-async def lending_bot_strategy():
+async def lending_bot_strategy(ctx: TenantRunCtx):
+    log = ctx.log
     log("=" * 60)
-    log(f"Running lending bot strategy (DRY_RUN={DRY_RUN})")
-    currency = _resolve_fund_currency()
+    log(f"Running lending bot strategy (DRY_RUN={ctx.dry_run})")
+    currency = ctx.currency
     now_ms = int(time.time() * 1000)
 
     # 1. Snapshot account state — if any of these fail, SKIP this round (don't act blind).
-    credits = await get_active_credits(currency)
-    offers = await list_lending_offers(currency)
-    wallet_avail = await get_available_balance(currency)
+    credits = await get_active_credits(ctx)
+    offers = await list_lending_offers(ctx)
+    wallet_avail = await get_available_balance(ctx)
     if credits is None or offers is None or wallet_avail is None:
         log("Skip: failed to fetch account state; leaving offers untouched.")
         return
@@ -1337,7 +1366,7 @@ async def lending_bot_strategy():
     cancel_attempts = len(cancel_queue_offers)
     cancel_successes = 0
     for o in cancel_queue_offers:
-        if await _cancel_offer(o):
+        if await _cancel_offer(ctx, o):
             cancel_successes += 1
         await asyncio.sleep(0.1)
     cancel_failures = cancel_attempts - cancel_successes
@@ -1348,8 +1377,8 @@ async def lending_bot_strategy():
     # 12. Before submitting, re-fetch wallet to confirm what really freed up.
     #     If some cancels silently failed, wallet will be smaller than expected and we
     #     must scale down the new orders rather than over-commit.
-    if not DRY_RUN:
-        actual_wallet = await get_available_balance(currency)
+    if not ctx.dry_run:
+        actual_wallet = await get_available_balance(ctx)
     else:
         actual_wallet = available_capital
     if actual_wallet is None:
@@ -1367,7 +1396,7 @@ async def lending_bot_strategy():
     submit_successes = 0
     submit_attempts = len(new_orders)
     for amount, rate, period in new_orders:
-        if await _submit_offer(currency, amount, rate, period):
+        if await _submit_offer(ctx, amount, rate, period):
             submit_successes += 1
         await asyncio.sleep(0.1)
     log(
@@ -1376,21 +1405,25 @@ async def lending_bot_strategy():
     )
 
 
-async def run_schedule_task():
-    try:
-        await lending_bot_strategy()
-    except Exception as e:
-        log(f"Strategy run failed: {e}")
+async def run_schedule_task(tenants: List[Tenant]):
+    for i, tenant in enumerate(tenants):
+        # Stagger tenants so their authenticated calls do not land in the same second.
+        if i:
+            await asyncio.sleep(_TENANT_STAGGER_SEC)
+        try:
+            await lending_bot_strategy(build_ctx(tenant))
+        except Exception as e:
+            log(f"[{tenant.name}] Strategy run failed: {e}")
 
 
 if __name__ == '__main__':
-    setup()
+    _tenants = setup()
     mode = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     if mode == 0:
-        asyncio.run(run_schedule_task())
+        asyncio.run(run_schedule_task(_tenants))
     else:
-        schedule.every(1).minutes.do(lambda: asyncio.run(run_schedule_task()))
-        asyncio.run(run_schedule_task())
+        schedule.every(1).minutes.do(lambda: asyncio.run(run_schedule_task(_tenants)))
+        asyncio.run(run_schedule_task(_tenants))
         while True:
             schedule.run_pending()
             time.sleep(1)
